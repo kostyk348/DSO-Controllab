@@ -1,5 +1,9 @@
 # DSO-ControlLab
 
+[![CI](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml/badge.svg)](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
+
 DSO-ControlLab is a small, reproducible research bench for testing the core DSO idea in control systems:
 
 > Move as many decisions as possible before runtime, then execute a verified deterministic plan.
