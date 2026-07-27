@@ -13,6 +13,7 @@ add_library(gp_core STATIC
     gp_tree.c
     gp_evolve.c
     gp_export.c
+    controllers.c
 )
 
 target_include_directories(gp_core PUBLIC .)

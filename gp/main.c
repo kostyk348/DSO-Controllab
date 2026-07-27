@@ -1,4 +1,5 @@
 #include "gp.h"
+#include "controllers.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,86 +22,21 @@ static void print_usage(const char *prog) {
         "  --seed N           RNG seed (default: time)\n"
         "  --export-c FILE    export best controller as C\n"
         "  --export-ada NAME  export best controller as Ada (NAME.ads + NAME.adb)\n"
-        "  --benchmark N      run full benchmark on N worlds (default: off)\n"
-        "  --json             output benchmark as JSON (default: table)\n"
+        "  --benchmark N      run full 5-way benchmark on N worlds\n"
+        "  --sweep N M        multi-seed sweep: seeds N..N+M-1, output CSV\n"
+        "  --json             output benchmark as JSON\n"
         "  --bloat R          anti-bloat penalty per tree node (default: 0.01)\n"
         "  --help             this help\n",
         prog);
 }
 
-/* ─── Controllers for comparison ─────────────────────────────── */
-
-/* PID */
-static double pid_run(double kp, double ki, double kd,
-                      const Plant *plant, int steps, double dt, uint64_t *seed,
-                      double *out_iae, double *out_overshoot,
-                      double *out_energy, int *out_saturated) {
-    double x[2] = {0,0}, y = 0;
-    double integral = 0, prev_error = 0, target = 1.0;
-    double iae = 0, overshoot = 0, energy = 0;
-    int saturated = 0;
-
-    for (int s = 0; s < steps; s++) {
-        double error = target - y;
-        integral += error * dt;
-        double deriv = (error - prev_error) / dt;
-        double u = kp * error + ki * integral + kd * deriv;
-        if (u > 4.0) u = 4.0; else if (u < -4.0) u = -4.0;
-        if (u >= 3.999 || u <= -3.999) saturated++;
-        double x_next[2];
-        plant_step(plant, x, u, dt, x_next, &y, seed);
-        x[0] = x_next[0]; x[1] = x_next[1];
-        iae += fabs(target - y) * dt;
-        energy += u * u;
-        if (y - target > overshoot) overshoot = y - target;
-        prev_error = error;
-    }
-    *out_iae = iae;
-    *out_overshoot = overshoot;
-    *out_energy = energy / steps;
-    *out_saturated = saturated;
-    return iae + 0.35*(overshoot>0?overshoot:0) + 0.04*(energy/steps) + 0.02*((double)saturated/steps);
+/* ─── Tree eval trampoline ────────────────────────────────────── */
+static double tree_eval_wrap(void *ctx, double error, double integral,
+                              double deriv, double y) {
+    return gp_tree_eval((const GpTree*)ctx, error, integral, deriv, y);
 }
 
-/* GP tree controller */
-static double gp_run(const GpTree *t, const Plant *plant, int steps, double dt, uint64_t *seed,
-                     double *out_iae, double *out_overshoot,
-                     double *out_energy, int *out_saturated) {
-    double x[2] = {0,0}, y = 0;
-    double integral = 0, prev_error = 0, target = 1.0;
-    double iae = 0, overshoot = 0, energy = 0;
-    int saturated = 0;
-
-    for (int s = 0; s < steps; s++) {
-        double error = target - y;
-        integral += error * dt;
-        double deriv = (error - prev_error) / dt;
-        double u = gp_tree_eval(t, error, integral, deriv, y);
-        if (u >= 3.999 || u <= -3.999) saturated++;
-        double x_next[2];
-        plant_step(plant, x, u, dt, x_next, &y, seed);
-        x[0] = x_next[0]; x[1] = x_next[1];
-        iae += fabs(target - y) * dt;
-        energy += u * u;
-        if (y - target > overshoot) overshoot = y - target;
-        prev_error = error;
-    }
-    *out_iae = iae;
-    *out_overshoot = overshoot;
-    *out_energy = energy / steps;
-    *out_saturated = saturated;
-    return iae + 0.35*(overshoot>0?overshoot:0) + 0.04*(energy/steps) + 0.02*((double)saturated/steps);
-}
-
-/* ─── Resource metrics (matching Python resource_metrics) ────── */
-static void resource_metrics(int cycles, int ram_bytes, int branch_points,
-                             double *out_wcet, double *out_jitter) {
-    (void)ram_bytes;
-    *out_wcet   = cycles * 0.1 + 1.0;
-    *out_jitter = branch_points * 0.15 + 0.05;
-}
-
-/* ─── Contract check (matching Python DeploymentContract) ────── */
+/* ─── Contract (matching Python DeploymentContract) ───────────── */
 typedef struct {
     int    cycles_max;
     int    ram_bytes_max;
@@ -114,23 +50,24 @@ typedef struct {
     int    finite_required;
 } Contract;
 
-static int contract_pass(const Contract *c, double iae, double overshoot,
-                         double energy, double wcet, double jitter,
-                         int cycles, int ram, double sat_frac,
-                         int is_finite) {
+static int contract_pass(const Contract *c, const ControllerResult *r,
+                          int steps, int cycles, int ram) {
     if (cycles > c->cycles_max) return 0;
     if (ram > c->ram_bytes_max) return 0;
-    if (wcet > c->wcet_us_max) return 0;
-    if (jitter > c->jitter_us_max) return 0;
-    if (iae > c->iae_max) return 0;
-    if (overshoot > c->overshoot_max) return 0;
+    if (r->wcet_us > c->wcet_us_max) return 0;
+    if (r->jitter_us > c->jitter_us_max) return 0;
+    if (r->iae > c->iae_max) return 0;
+    if (r->overshoot > c->overshoot_max) return 0;
+    double sat_frac = (double)r->saturated / steps;
     if (sat_frac > c->saturation_fraction_max) return 0;
-    if (c->finite_required && !is_finite) return 0;
-    (void)energy;
+    if (c->finite_required) {
+        if (!isfinite(r->iae) || !isfinite(r->overshoot) || !isfinite(r->energy))
+            return 0;
+    }
     return 1;
 }
 
-/* ─── Sign test ──────────────────────────────────────────────── */
+/* ─── Sign test ───────────────────────────────────────────────── */
 static double sign_test_pvalue(const double *a, const double *b, int n) {
     int pos = 0, neg = 0;
     for (int i = 0; i < n; i++) {
@@ -139,22 +76,33 @@ static double sign_test_pvalue(const double *a, const double *b, int n) {
     }
     int N = pos + neg;
     if (N == 0) return 1.0;
-    /* Binomial sign test p-value (two-sided) */
-    double k = (pos < neg) ? pos : neg;
-    /* Normal approximation for N > 25, else exact (simple approx) */
-    if (N > 25) {
-        double z = (k + 0.5 - N/2.0) / (sqrt((double)N) / 2.0);
-        double p = erfc(fabs(z) / 1.41421356237); /* approximation */
-        return p;
-    }
-    /* For small N, return simple ratio */
-    return 2.0 * (k + 1.0) / (N + 1.0);
+    double k = (pos < neg) ? (double)pos : (double)neg;
+    /* Normal approximation */
+    double z = (k + 0.5 - N / 2.0) / (sqrt((double)N) / 2.0);
+    return erfc(fabs(z) / 1.41421356237);
 }
 
-/* ─── Benchmark ──────────────────────────────────────────────── */
+/* ─── Full 5-way benchmark ────────────────────────────────────── */
+
+typedef struct {
+    const char *name;
+    int   cycles;
+    int   ram;
+    int   branch;
+} CtrlProfile;
+
+static const CtrlProfile profiles[] = {
+    {"GP",   42, 40, 1},
+    {"PID",  42, 40, 1},
+    {"LQR",  58, 64, 1},
+    {"MPC", 620,176,10},
+    {"DSO",  32, 36, 0},
+};
+#define N_CONTROLLERS 5
 
 static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
-                          const GpTree *best_gp, int verbose, int json_mode) {
+                          const GpTree *best_gp, int json_mode)
+{
     Contract c_default = {
         .cycles_max = 180,
         .ram_bytes_max = 96,
@@ -168,170 +116,298 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         .finite_required = 1
     };
 
-    /* PID candidates (same as Python) */
-    double kp_list[] = {0.8, 1.3, 2.0, 2.9};
-    double ki_list[] = {0.0, 0.12, 0.28};
-    double kd_list[] = {0.0, 0.08, 0.20};
-    int n_kp = 4, n_ki = 3, n_kd = 3;
-
     /* Per-world scores for sign test */
-    double *gp_scores = (double*)calloc(n_worlds, sizeof(double));
-    double *pid_scores = (double*)calloc(n_worlds, sizeof(double));
-
-    /* Aggregate stats */
-    double sum_gp_iae = 0, sum_gp_os = 0, sum_gp_en = 0, sum_gp_sat = 0;
-    double sum_pid_iae = 0, sum_pid_os = 0, sum_pid_en = 0, sum_pid_sat = 0;
-    int gp_contract_pass = 0, pid_contract_pass = 0;
-
-    /* Resource metrics */
-    int gp_cycles = 42, gp_ram = 40, gp_branch = 1;
-    int pid_cycles = 42, pid_ram = 40, pid_branch = 1;
-    double gp_wcet, gp_jitter, pid_wcet, pid_jitter;
-    resource_metrics(gp_cycles, gp_ram, gp_branch, &gp_wcet, &gp_jitter);
-    resource_metrics(pid_cycles, pid_ram, pid_branch, &pid_wcet, &pid_jitter);
-
-    if (verbose && !json_mode) {
-        printf("\n===== FULL BENCHMARK: %d worlds =====\n", n_worlds);
-        printf("%-6s %8s %8s %8s %6s %6s\n",
-               "World", "IAE", "Oversht", "Energy", "Sat%", "Score");
-        printf("------ -------- -------- -------- ------ ------\n");
+    double *all_scores[N_CONTROLLERS];
+    double *all_iae[N_CONTROLLERS];
+    double *all_os[N_CONTROLLERS];
+    double *all_en[N_CONTROLLERS];
+    int    *all_sat[N_CONTROLLERS];
+    int    *all_cpass[N_CONTROLLERS];
+    for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+        all_scores[ci]  = (double*)calloc(n_worlds, sizeof(double));
+        all_iae[ci]     = (double*)calloc(n_worlds, sizeof(double));
+        all_os[ci]      = (double*)calloc(n_worlds, sizeof(double));
+        all_en[ci]      = (double*)calloc(n_worlds, sizeof(double));
+        all_sat[ci]     = (int*)calloc(n_worlds, sizeof(int));
+        all_cpass[ci]   = (int*)calloc(n_worlds, sizeof(int));
     }
+
+    double sum_score[N_CONTROLLERS] = {0};
 
     for (int w = 0; w < n_worlds; w++) {
         uint64_t ws = seed + (uint64_t)w * 100000ULL;
         Plant plant = plant_random(&ws);
 
-        /* Run GP */
-        double gp_iae, gp_os, gp_en;
-        int gp_sat;
-        double gp_sc = gp_run(best_gp, &plant, steps, dt, &ws,
-                              &gp_iae, &gp_os, &gp_en, &gp_sat);
-        gp_scores[w] = gp_sc;
-        sum_gp_iae += gp_iae; sum_gp_os += gp_os;
-        sum_gp_en += gp_en; sum_gp_sat += gp_sat;
-        if (contract_pass(&c_default, gp_iae, gp_os, gp_en,
-                          gp_wcet, gp_jitter,
-                          gp_cycles, gp_ram, (double)gp_sat/steps, 1))
-            gp_contract_pass++;
+        /* Compute LQR gain once per world */
+        double K[2];
+        lqr_compute_gain(&plant, dt, K);
 
-        /* Find best PID for this world */
-        double best_pid_sc = 1e10;
-        double best_pid_iae = 0, best_pid_os = 0, best_pid_en = 0;
-        int best_pid_sat = 0;
-        for (int ip = 0; ip < n_kp; ip++) {
-            for (int ii = 0; ii < n_ki; ii++) {
-                for (int id = 0; id < n_kd; id++) {
-                    double pid_iae, pid_os, pid_en;
-                    int pid_sat;
-                    double ps = pid_run(kp_list[ip], ki_list[ii], kd_list[id],
-                                       &plant, steps, dt, &ws,
-                                       &pid_iae, &pid_os, &pid_en, &pid_sat);
-                    if (ps < best_pid_sc) {
-                        best_pid_sc = ps;
-                        best_pid_iae = pid_iae;
-                        best_pid_os = pid_os;
-                        best_pid_en = pid_en;
-                        best_pid_sat = pid_sat;
+        /* Run each controller */
+        ControllerResult results[N_CONTROLLERS];
+
+        /* GP */
+        results[0] = gp_simulate((void*)best_gp, &plant, steps, dt, &ws, tree_eval_wrap);
+
+        /* PID: find best PID for this world (36 candidates) */
+        {
+            double best_sc = 1e100;
+            int best_idx = -1;
+            ControllerResult cand_r[36];
+            int npid = 0;
+            double kp_list[] = {0.8, 1.3, 2.0, 2.9};
+            double ki_list[] = {0.0, 0.12, 0.28};
+            double kd_list[] = {0.0, 0.08, 0.20};
+            for (int ip = 0; ip < 4; ip++) {
+                for (int ii = 0; ii < 3; ii++) {
+                    for (int id = 0; id < 3; id++) {
+                        ControllerResult r = pid_simulate(kp_list[ip], ki_list[ii], kd_list[id],
+                                                          &plant, steps, dt, &ws);
+                        double wcet, jitter;
+                        controller_resource_metrics(profiles[1].cycles, profiles[1].ram,
+                                                     profiles[1].branch, &wcet, &jitter);
+                        double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                        cand_r[npid] = r;
+                        cand_r[npid].wcet_us = wcet;
+                        cand_r[npid].jitter_us = jitter;
+                        cand_r[npid].cycles = profiles[1].cycles;
+                        cand_r[npid].ram_bytes = profiles[1].ram;
+                        cand_r[npid].branch_points = profiles[1].branch;
+                        cand_r[npid].score = sc;
+                        if (sc < best_sc) { best_sc = sc; best_idx = npid; }
+                        npid++;
                     }
                 }
             }
+            results[1] = cand_r[best_idx];
         }
-        pid_scores[w] = best_pid_sc;
-        sum_pid_iae += best_pid_iae; sum_pid_os += best_pid_os;
-        sum_pid_en += best_pid_en; sum_pid_sat += best_pid_sat;
-        if (contract_pass(&c_default, best_pid_iae, best_pid_os, best_pid_en,
-                          pid_wcet, pid_jitter,
-                          pid_cycles, pid_ram, (double)best_pid_sat/steps, 1))
-            pid_contract_pass++;
 
-        if (verbose && !json_mode && (w < 10 || w % 100 == 99 || w == n_worlds-1)) {
-            printf("%-6d %8.4f %8.4f %8.4f %5.1f%% %6.3f  | PID: %6.3f\n",
-                   w, gp_iae, gp_os, gp_en, 100.0*gp_sat/steps, gp_sc, best_pid_sc);
+        /* LQR */
+        results[2] = lqr_simulate(K, &plant, steps, dt, &ws);
+
+        /* MPC */
+        results[3] = mpc_simulate(&plant, steps, dt, &ws);
+
+        /* DSO = best PID (36 candidates, DSO resource profile) */
+        {
+            double best_sc = 1e100;
+            int best_idx = -1;
+            ControllerResult cand_r[36];
+            int npid = 0;
+            double kp_list[] = {0.8, 1.3, 2.0, 2.9};
+            double ki_list[] = {0.0, 0.12, 0.28};
+            double kd_list[] = {0.0, 0.08, 0.20};
+            for (int ip = 0; ip < 4; ip++) {
+                for (int ii = 0; ii < 3; ii++) {
+                    for (int id = 0; id < 3; id++) {
+                        ControllerResult r = pid_simulate(kp_list[ip], ki_list[ii], kd_list[id],
+                                                          &plant, steps, dt, &ws);
+                        double wcet, jitter;
+                        controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
+                                                     profiles[4].branch, &wcet, &jitter);
+                        double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                        cand_r[npid] = r;
+                        cand_r[npid].wcet_us = wcet;
+                        cand_r[npid].jitter_us = jitter;
+                        cand_r[npid].cycles = profiles[4].cycles;
+                        cand_r[npid].ram_bytes = profiles[4].ram;
+                        cand_r[npid].branch_points = profiles[4].branch;
+                        cand_r[npid].score = sc;
+                        if (sc < best_sc) { best_sc = sc; best_idx = npid; }
+                        npid++;
+                    }
+                }
+            }
+            results[4] = cand_r[best_idx];
+        }
+
+        /* Set resource metrics + score for all controllers */
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            ControllerResult *r = &results[ci];
+            if (ci != 1 && ci != 4) { /* PID and DSO already have them */
+                controller_resource_metrics(profiles[ci].cycles, profiles[ci].ram,
+                                             profiles[ci].branch, &r->wcet_us, &r->jitter_us);
+                r->cycles = profiles[ci].cycles;
+                r->ram_bytes = profiles[ci].ram;
+                r->branch_points = profiles[ci].branch;
+                r->score = controller_score(r->iae, r->overshoot, r->energy,
+                                             r->wcet_us, r->jitter_us);
+            }
+        }
+
+        /* Accumulate */
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            all_scores[ci][w] = results[ci].score;
+            all_iae[ci][w]    = results[ci].iae;
+            all_os[ci][w]     = results[ci].overshoot;
+            all_en[ci][w]     = results[ci].energy;
+            all_sat[ci][w]    = results[ci].saturated;
+            all_cpass[ci][w]  = contract_pass(&c_default, &results[ci], steps,
+                                               results[ci].cycles, results[ci].ram_bytes);
+            sum_score[ci] += results[ci].score;
         }
     }
 
-    /* Averages */
-    double avg_gp_iae = sum_gp_iae / n_worlds;
-    double avg_gp_os  = sum_gp_os  / n_worlds;
-    double avg_gp_en  = sum_gp_en  / n_worlds;
-    double avg_gp_sat = sum_gp_sat / n_worlds;
-    double avg_pid_iae = sum_pid_iae / n_worlds;
-    double avg_pid_os  = sum_pid_os  / n_worlds;
-    double avg_pid_en  = sum_pid_en  / n_worlds;
-    double avg_pid_sat = sum_pid_sat / n_worlds;
-
-    /* Improvement */
-    double avg_gp_sc = 0, avg_pid_sc = 0;
-    for (int w = 0; w < n_worlds; w++) {
-        avg_gp_sc += gp_scores[w];
-        avg_pid_sc += pid_scores[w];
-    }
-    avg_gp_sc /= n_worlds;
-    avg_pid_sc /= n_worlds;
-    double impr = (avg_pid_sc - avg_gp_sc) / avg_pid_sc * 100.0;
-
-    /* Sign test */
-    double pval = sign_test_pvalue(gp_scores, pid_scores, n_worlds);
-
+    /* ─── Output ───────────────────────────────────────────── */
     if (json_mode) {
-        printf("{\n");
-        printf("  \"n_worlds\": %d,\n", n_worlds);
-        printf("  \"steps\": %d,\n", steps);
-        printf("  \"dt\": %.4f,\n", dt);
-        printf("  \"gp\": {\n");
-        printf("    \"iae\": { \"mean\": %.6f },\n", avg_gp_iae);
-        printf("    \"overshoot\": { \"mean\": %.6f },\n", avg_gp_os);
-        printf("    \"energy\": { \"mean\": %.6f },\n", avg_gp_en);
-        printf("    \"saturation_frac\": { \"mean\": %.6f },\n", avg_gp_sat/steps);
-        printf("    \"score\": { \"mean\": %.6f },\n", avg_gp_sc);
-        printf("    \"wcet_us\": %.2f,\n", gp_wcet);
-        printf("    \"jitter_us\": %.2f,\n", gp_jitter);
-        printf("    \"cycles\": %d,\n", gp_cycles);
-        printf("    \"ram_bytes\": %d,\n", gp_ram);
-        printf("    \"branch_points\": %d,\n", gp_branch);
-        printf("    \"contract_pass_rate\": %.4f\n", (double)gp_contract_pass/n_worlds);
-        printf("  },\n");
-        printf("  \"pid\": {\n");
-        printf("    \"iae\": { \"mean\": %.6f },\n", avg_pid_iae);
-        printf("    \"overshoot\": { \"mean\": %.6f },\n", avg_pid_os);
-        printf("    \"energy\": { \"mean\": %.6f },\n", avg_pid_en);
-        printf("    \"saturation_frac\": { \"mean\": %.6f },\n", avg_pid_sat/steps);
-        printf("    \"score\": { \"mean\": %.6f },\n", avg_pid_sc);
-        printf("    \"wcet_us\": %.2f,\n", pid_wcet);
-        printf("    \"jitter_us\": %.2f,\n", pid_jitter);
-        printf("    \"cycles\": %d,\n", pid_cycles);
-        printf("    \"ram_bytes\": %d,\n", pid_ram);
-        printf("    \"branch_points\": %d,\n", pid_branch);
-        printf("    \"contract_pass_rate\": %.4f\n", (double)pid_contract_pass/n_worlds);
-        printf("  },\n");
-        printf("  \"improvement_pct\": %.2f,\n", impr);
-        printf("  \"sign_test_pvalue\": %.6f,\n", pval);
-        printf("  \"gp_beats_pid\": %s\n", (avg_gp_sc < avg_pid_sc) ? "true" : "false");
-        printf("}\n");
+        printf("{\n  \"n_worlds\": %d,\n  \"steps\": %d,\n  \"dt\": %.4f,\n", n_worlds, steps, dt);
+        printf("  \"controllers\": [\n");
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            double avg_sc = sum_score[ci] / n_worlds;
+            double avg_iae = 0, avg_os = 0, avg_en = 0;
+            double avg_sat = 0;
+            int cp = 0;
+            for (int w = 0; w < n_worlds; w++) {
+                avg_iae += all_iae[ci][w];
+                avg_os  += all_os[ci][w];
+                avg_en  += all_en[ci][w];
+                avg_sat += all_sat[ci][w];
+                cp += all_cpass[ci][w];
+            }
+            avg_iae /= n_worlds; avg_os /= n_worlds;
+            avg_en /= n_worlds; avg_sat /= n_worlds;
+            printf("    {\n");
+            printf("      \"name\": \"%s\",\n", profiles[ci].name);
+            printf("      \"iae_mean\": %.6f,\n", avg_iae);
+            printf("      \"overshoot_mean\": %.6f,\n", avg_os);
+            printf("      \"energy_mean\": %.6f,\n", avg_en);
+            printf("      \"saturation_frac\": %.6f,\n", avg_sat/steps);
+            printf("      \"score_mean\": %.6f,\n", avg_sc);
+            printf("      \"wcet_us\": %.4f,\n", all_iae[ci][0] == all_iae[ci][0] ? profiles[ci].cycles / 48.0 : 0);
+            printf("      \"jitter_us\": %.4f,\n", 0.04 + 0.055 * profiles[ci].branch);
+            printf("      \"cycles\": %d,\n", profiles[ci].cycles);
+            printf("      \"ram_bytes\": %d,\n", profiles[ci].ram);
+            printf("      \"branch_points\": %d,\n", profiles[ci].branch);
+            printf("      \"contract_pass_rate\": %.4f%s\n",
+                   (double)cp / n_worlds, ci < N_CONTROLLERS-1 ? "," : "");
+            printf("    }%s\n", ci < N_CONTROLLERS-1 ? "," : "");
+        }
+        printf("  ],\n");
+        /* Sign tests */
+        printf("  \"sign_tests_vs_dso\": {\n");
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            if (strcmp(profiles[ci].name, "DSO") == 0) continue;
+            double pv = sign_test_pvalue(all_scores[ci], all_scores[4], n_worlds);
+            printf("    \"%s\": %.6f%s\n", profiles[ci].name, pv,
+                   ci < N_CONTROLLERS-1 ? "," : "");
+        }
+        printf("  }\n}\n");
     } else {
-        printf("\n===== BENCHMARK RESULTS =====\n");
-        printf("%-20s %12s %12s\n", "Metric", "GP", "Best PID");
-        printf("-------------------- ------------ ------------\n");
-        printf("%-20s %12.6f %12.6f\n", "IAE (mean)", avg_gp_iae, avg_pid_iae);
-        printf("%-20s %12.6f %12.6f\n", "Overshoot (mean)", avg_gp_os, avg_pid_os);
-        printf("%-20s %12.6f %12.6f\n", "Energy (mean)", avg_gp_en, avg_pid_en);
-        printf("%-20s %12.2f %12.2f\n", "Saturation frac (%)", 100.0*avg_gp_sat/steps, 100.0*avg_pid_sat/steps);
-        printf("%-20s %12.6f %12.6f\n", "Score (mean)", avg_gp_sc, avg_pid_sc);
-        printf("%-20s %12.2f %12.2f\n", "WCET (us)", gp_wcet, pid_wcet);
-        printf("%-20s %12.2f %12.2f\n", "Jitter (us)", gp_jitter, pid_jitter);
-        printf("%-20s %12d %12d\n", "Cycles", gp_cycles, pid_cycles);
-        printf("%-20s %12d %12d\n", "RAM (bytes)", gp_ram, pid_ram);
-        printf("%-20s %12d %12d\n", "Branch points", gp_branch, pid_branch);
-        printf("%-20s %12.2f%% %12.2f%%\n", "Contract pass rate", 100.0*(double)gp_contract_pass/n_worlds, 100.0*(double)pid_contract_pass/n_worlds);
+        printf("\n========== 5-WAY BENCHMARK: %d worlds ==========\n", n_worlds);
+        printf("%-6s", "Ctrl");
+        printf(" %10s %10s %10s %7s %10s %7s %7s %5s %4s %6s",
+               "IAE", "Overshoot", "Energy", "Sat%", "Score",
+               "WCETus", "Jitus", "Cyc", "RAM", "Ctr%");
         printf("\n");
-        printf("GP improvement over PID: %.2f%%\n", impr);
-        printf("Sign test p-value: %.6f  (GP beats PID: %s)\n",
-               pval, avg_gp_sc < avg_pid_sc ? "YES" : "NO");
+        printf("------");
+        printf(" ---------- ---------- ---------- ------- ---------- ------- ------- ----- ---- ------\n");
+
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            double avg_sc = sum_score[ci] / n_worlds;
+            double avg_iae = 0, avg_os = 0, avg_en = 0;
+            double avg_sat = 0;
+            int cp = 0;
+            for (int w = 0; w < n_worlds; w++) {
+                avg_iae += all_iae[ci][w];
+                avg_os  += all_os[ci][w];
+                avg_en  += all_en[ci][w];
+                avg_sat += all_sat[ci][w];
+                cp += all_cpass[ci][w];
+            }
+            avg_iae /= n_worlds; avg_os /= n_worlds;
+            avg_en /= n_worlds; avg_sat /= n_worlds;
+
+            printf("%-6s", profiles[ci].name);
+            printf(" %10.6f %10.6f %10.6f %6.2f%% %10.6f",
+                   avg_iae, avg_os, avg_en,
+                   100.0 * avg_sat / steps,
+                   avg_sc);
+            printf(" %6.2f %6.3f %4d %4d %5.1f%%",
+                   profiles[ci].cycles / 48.0,
+                   0.04 + 0.055 * profiles[ci].branch,
+                   profiles[ci].cycles,
+                   profiles[ci].ram,
+                   100.0 * (double)cp / n_worlds);
+            printf("\n");
+        }
+        printf("------");
+        printf(" ---------- ---------- ---------- ------- ---------- ------- ------- ----- ---- ------\n");
+
+        /* Sign tests vs DSO */
+        printf("\nSign tests (two-sided, vs DSO):\n");
+        for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+            if (strcmp(profiles[ci].name, "DSO") == 0) continue;
+            double pv = sign_test_pvalue(all_scores[ci], all_scores[4], n_worlds);
+            int wins = 0, losses = 0;
+            for (int w = 0; w < n_worlds; w++) {
+                if (all_scores[ci][w] < all_scores[4][w]) wins++;
+                else if (all_scores[ci][w] > all_scores[4][w]) losses++;
+            }
+            printf("  %s vs DSO: wins=%d losses=%d p=%.6f\n",
+                   profiles[ci].name, wins, losses, pv);
+        }
+
+        /* Compare GP best vs each other */
+        printf("\nGP improvement over others:\n");
+        for (int ci = 1; ci < N_CONTROLLERS; ci++) {
+            double gp_avg = sum_score[0] / n_worlds;
+            double other_avg = sum_score[ci] / n_worlds;
+            double impr = (other_avg - gp_avg) / (other_avg > 0 ? other_avg : 1) * 100;
+            printf("  GP vs %s: %+.2f%%  (GP=%.4f, %s=%.4f)\n",
+                   profiles[ci].name, impr, gp_avg, profiles[ci].name, other_avg);
+        }
     }
 
-    free(gp_scores);
-    free(pid_scores);
+    for (int ci = 0; ci < N_CONTROLLERS; ci++) {
+        free(all_scores[ci]);
+        free(all_iae[ci]);
+        free(all_os[ci]);
+        free(all_en[ci]);
+        free(all_sat[ci]);
+        free(all_cpass[ci]);
+    }
 }
+
+/* ─── Multi-seed sweep ────────────────────────────────────────── */
+
+static void run_sweep(int start_seed, int n_seeds, int n_worlds,
+                       int steps, double dt, int pop_size, int generations,
+                       int max_depth, double mut_rate, double cross_rate,
+                       int tournament_size, double bloat_penalty)
+{
+    /* CSV header */
+    printf("seed,gen,worlds,steps,fitness,tree_size,best_score_path\n");
+
+    for (int s = 0; s < n_seeds; s++) {
+        uint64_t seed = (uint64_t)(start_seed + s);
+
+        GpPopulation pop = {0};
+        gp_evolve(&pop, pop_size, generations, max_depth,
+                  mut_rate, cross_rate, tournament_size,
+                  n_worlds, steps, dt, bloat_penalty, seed);
+
+        /* Run benchmark with best tree */
+        for (int w = 0; w < n_worlds; w++) {
+            uint64_t ws = seed + (uint64_t)w * 100000ULL;
+            Plant plant = plant_random(&ws);
+            ControllerResult r = gp_simulate((void*)&pop.trees[0], &plant,
+                                              steps, dt, &ws, tree_eval_wrap);
+            (void)r;
+        }
+
+        char tree_str[2048];
+        gp_tree_print(&pop.trees[0], tree_str, sizeof(tree_str));
+
+        printf("%d,%d,%d,%d,%.6f,%d,\"%s\"\n",
+               start_seed + s, generations, n_worlds, steps,
+               pop.trees[0].fitness, pop.trees[0].size, tree_str);
+
+        free(pop.trees);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════ */
+/*  MAIN                                                          */
+/* ═══════════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
     /* Defaults */
@@ -348,6 +424,7 @@ int main(int argc, char **argv) {
     const char *export_c = NULL;
     const char *export_ada = NULL;
     int benchmark = 0;
+    int sweep_start = 0, sweep_count = 0;
     int json_mode = 0;
     double bloat_penalty = 0.01;
 
@@ -367,10 +444,25 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--export-c") == 0 && i+1 < argc)   export_c = argv[++i];
         else if (strcmp(argv[i], "--export-ada") == 0 && i+1 < argc) export_ada = argv[++i];
         else if (strcmp(argv[i], "--benchmark") == 0 && i+1 < argc)  benchmark = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--sweep") == 0) {
+            if (i+2 < argc) { sweep_start = atoi(argv[++i]); sweep_count = atoi(argv[++i]); }
+            else { fprintf(stderr, "--sweep needs START COUNT\n"); return 1; }
+        }
         else if (strcmp(argv[i], "--json") == 0)     json_mode = 1;
         else if (strcmp(argv[i], "--bloat") == 0 && i+1 < argc) bloat_penalty = atof(argv[++i]);
         else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
     }
+
+    /* Multi-seed sweep mode */
+    if (sweep_count > 0) {
+        run_sweep(sweep_start, sweep_count, n_worlds, steps, dt,
+                  pop_size, generations, max_depth, mut_rate, cross_rate,
+                  tournament_size, bloat_penalty);
+        return 0;
+    }
+
+    /* Run evolution */
+    GpPopulation pop = {0};
 
     printf("DSO GP — Genetic Programming for Controller Synthesis\n");
     printf("====================================================\n");
@@ -380,9 +472,7 @@ int main(int argc, char **argv) {
            n_worlds, steps, dt, (unsigned long long)seed);
     printf("\n");
 
-    /* Run evolution */
-    GpPopulation pop = {0};
-    fprintf(stderr, "Initializing population...\n");
+    fflush(stdout);
     gp_evolve(&pop, pop_size, generations, max_depth,
               mut_rate, cross_rate, tournament_size,
               n_worlds, steps, dt, bloat_penalty, seed);
@@ -417,7 +507,7 @@ int main(int argc, char **argv) {
 
     /* Benchmark */
     if (benchmark > 0) {
-        run_benchmark(benchmark, steps, dt, seed, &pop.trees[0], 1, json_mode);
+        run_benchmark(benchmark, steps, dt, seed, &pop.trees[0], json_mode);
     }
 
     /* Cleanup */
