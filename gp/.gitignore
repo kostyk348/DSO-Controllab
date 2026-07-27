@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+*.o
+*.ali
+dso_gp
+
+# Generated controller files
+controller.ads
+controller.adb
+*_gp.ads
+*_gp.adb
+*_verified.ads
+*_verified.adb
+best_controller.*
+controller.gpr.user
+
+# GNATprove
+gnatprove/
+
+# Python
+__pycache__/

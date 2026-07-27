@@ -1,0 +1,10 @@
+project Controller is
+   for Source_Files use ("controller.ads", "controller.adb");
+   package Compiler is
+      for Switches ("ada") use ("-gnatwa");
+   end Compiler;
+   package Prove is
+      for Provers use ("z3");
+      for Timeout use 30;
+   end Prove;
+end Controller;
