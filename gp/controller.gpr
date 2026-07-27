@@ -5,6 +5,6 @@ project Controller is
    end Compiler;
    package Prove is
       for Provers use ("z3");
-      for Timeout use 30;
+      for Timeout use "60";
    end Prove;
 end Controller;

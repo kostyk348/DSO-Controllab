@@ -80,7 +80,7 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
                int max_depth, double mut_rate, double cross_rate,
                int tournament_size,
                int n_worlds, int steps, double dt,
-               double bloat_penalty, uint64_t seed) {
+               double bloat_penalty, uint64_t seed, FILE *gen_log) {
 
     if (!pop->trees || pop->capacity < pop_size) {
         if (pop->trees) free(pop->trees);
@@ -104,6 +104,11 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
 
     /* Allocate next generation */
     GpTree *next_gen = (GpTree*)calloc((size_t)pop_size, sizeof(GpTree));
+
+    /* Write gen log header */
+    if (gen_log) {
+        fprintf(gen_log, "gen,best_fitness,avg_top5\n");
+    }
 
     /* Find initial best */
     GpTree best_all_time;
@@ -182,6 +187,12 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
         double avg_top5 = 0;
         for (int k = 0; k < 5 && k < pop_size; k++) avg_top5 += trees[k].fitness;
         avg_top5 /= (5 < pop_size ? 5 : pop_size);
+
+        if (gen_log) {
+            fprintf(gen_log, "%d,%.6f,%.6f\n",
+                    gen + 1, trees[gen_best].fitness, avg_top5);
+            fflush(gen_log);
+        }
 
         fprintf(stderr, "  gen %3d/%d  best=%.4f  avg=%.4f\n",
                 gen + 1, generations,

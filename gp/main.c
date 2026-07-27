@@ -1,10 +1,12 @@
 #include "gp.h"
 #include "controllers.h"
+#include "stability.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <sys/stat.h>
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -24,8 +26,13 @@ static void print_usage(const char *prog) {
         "  --export-ada NAME  export best controller as Ada (NAME.ads + NAME.adb)\n"
         "  --benchmark N      run full 5-way benchmark on N worlds\n"
         "  --sweep N M        multi-seed sweep: seeds N..N+M-1, output CSV\n"
+        "  --gen-log FILE     save gen-by-gen fitness as CSV\n"
+        "  --csv-out FILE     save benchmark results as CSV\n"
+        "  --plot FILE        generate gnuplot script for --gen-log data\n"
+        "  --stability N      stability analysis on N perturbed worlds\n"
         "  --json             output benchmark as JSON\n"
         "  --bloat R          anti-bloat penalty per tree node (default: 0.01)\n"
+        "  --verify           run GNATprove on exported Ada (needs --export-ada)\n"
         "  --help             this help\n",
         prog);
 }
@@ -82,6 +89,115 @@ static double sign_test_pvalue(const double *a, const double *b, int n) {
     return erfc(fabs(z) / 1.41421356237);
 }
 
+/* ─── Write gnuplot script ───────────────────────────────────── */
+static void write_plot_script(const char *path, const char *gen_log_path,
+                               int generations)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "Can't write %s\n", path); return; }
+    fprintf(f,
+        "# DSO-GP convergence plot\n"
+        "# Usage: gnuplot %s\n\n"
+        "set terminal pngcairo size 800,600\n"
+        "set output '%s.png'\n"
+        "set title 'GP Evolution Convergence'\n"
+        "set xlabel 'Generation'\n"
+        "set ylabel 'Fitness (lower is better)'\n"
+        "set grid\n"
+        "set key top right\n"
+        "set xrange [1:%d]\n\n"
+        "plot '%s' using 1:2 with lines lw 2 title 'Best fitness', \\\n"
+        "     '%s' using 1:3 with lines lw 1 lt 3 title 'Avg top-5'\n",
+        path, path, generations, gen_log_path, gen_log_path);
+    fclose(f);
+    printf("Saved gnuplot script: %s\n", path);
+}
+
+/* ─── Run GNATprove on exported Ada ──────────────────────────── */
+static void run_gnatprove(const char *name)
+{
+    char cmd[4096];
+    /* Check common paths */
+    const char *gnatprove_paths[] = {
+        "gnatprove",
+        "$HOME/.alire/bin/gnatprove",
+        "/usr/local/bin/gnatprove",
+        "/usr/bin/gnatprove",
+        NULL
+    };
+    char gnatprove[1024] = {0};
+    for (int i = 0; gnatprove_paths[i]; i++) {
+        char expanded[1024];
+        snprintf(expanded, sizeof(expanded), "%s", gnatprove_paths[i]);
+        /* Expand $HOME */
+        if (expanded[0] == '$') {
+            const char *home = getenv("HOME");
+            if (home) {
+                char tmp[1024];
+                snprintf(tmp, sizeof(tmp), "%s%s", home, expanded + 5);
+                snprintf(expanded, sizeof(expanded), "%s", tmp);
+            }
+        }
+        struct stat st;
+        if (stat(expanded, &st) == 0 && (st.st_mode & S_IXUSR)) {
+            snprintf(gnatprove, sizeof(gnatprove), "%s", expanded);
+            break;
+        }
+    }
+    if (gnatprove[0] == '\0') {
+        printf("gnatprove not found. Install with: alr install gnatprove\n");
+        return;
+    }
+    /* Find controller.gpr — try cwd, ../, gp/, ../gp/ */
+    const char *gpr_candidates[] = {
+        "controller.gpr",
+        "../controller.gpr",
+        "gp/controller.gpr",
+        "../gp/controller.gpr",
+        NULL
+    };
+    const char *gpr = "controller.gpr";
+    struct stat st;
+    for (int i = 0; gpr_candidates[i]; i++) {
+        if (stat(gpr_candidates[i], &st) == 0) {
+            gpr = gpr_candidates[i];
+            break;
+        }
+    }
+    char dirname[1024];
+    snprintf(dirname, sizeof(dirname), "%s", gpr);
+    /* Get directory of gpr for relative path resolution */
+    char *slash = strrchr(dirname, '/');
+    if (slash) *slash = '\0'; else snprintf(dirname, sizeof(dirname), ".");
+
+    /* Also add $HOME/.alire/bin to PATH for gnatprove to find Z3 */
+    const char *home = getenv("HOME");
+    snprintf(cmd, sizeof(cmd),
+        "dir=$(mktemp -d) && "
+        "cp %s.ads \"$dir/controller.ads\" && "
+        "cp %s.adb \"$dir/controller.adb\" && "
+        "cp \"%s\" \"$dir/controller.gpr\" && "
+        "export PATH=\"%s/.alire/bin:$PATH\" && "
+        "cd \"$dir\" && %s -P controller.gpr --level=2 2>&1; "
+        "rc=$?; rm -rf \"$dir\"; exit $rc",
+        name, name, gpr,
+        home ? home : "",
+        gnatprove);
+    printf("\n--- GNATprove verification ---\n");
+    fflush(stdout);
+    int rc = system(cmd);
+    if (rc == 0)
+        printf("--- GNATprove: SUCCESS (all checks proved) ---\n");
+    else
+        printf("--- GNATprove: FAILED (exit code %d) ---\n", rc);
+}
+
+/* Forward declarations */
+static void write_benchmark_csv(const char *path, int n_worlds,
+                                 double **scores, double **iaes,
+                                 double **oss, double **ens,
+                                 int **sats, int **cpass);
+
 /* ─── Full 5-way benchmark ────────────────────────────────────── */
 
 typedef struct {
@@ -101,7 +217,8 @@ static const CtrlProfile profiles[] = {
 #define N_CONTROLLERS 5
 
 static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
-                          const GpTree *best_gp, int json_mode)
+                          const GpTree *best_gp, int json_mode,
+                          const char *csv_out_path)
 {
     Contract c_default = {
         .cycles_max = 180,
@@ -187,37 +304,60 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         /* MPC */
         results[3] = mpc_simulate(&plant, steps, dt, &ws);
 
-        /* DSO = best PID (36 candidates, DSO resource profile) */
+        /* DSO: try GP first, verify against contract, fallback to best PID */
         {
-            double best_sc = 1e100;
-            int best_idx = -1;
-            ControllerResult cand_r[36];
-            int npid = 0;
-            double kp_list[] = {0.8, 1.3, 2.0, 2.9};
-            double ki_list[] = {0.0, 0.12, 0.28};
-            double kd_list[] = {0.0, 0.08, 0.20};
-            for (int ip = 0; ip < 4; ip++) {
-                for (int ii = 0; ii < 3; ii++) {
-                    for (int id = 0; id < 3; id++) {
-                        ControllerResult r = pid_simulate(kp_list[ip], ki_list[ii], kd_list[id],
-                                                          &plant, steps, dt, &ws);
-                        double wcet, jitter;
-                        controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
-                                                     profiles[4].branch, &wcet, &jitter);
-                        double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
-                        cand_r[npid] = r;
-                        cand_r[npid].wcet_us = wcet;
-                        cand_r[npid].jitter_us = jitter;
-                        cand_r[npid].cycles = profiles[4].cycles;
-                        cand_r[npid].ram_bytes = profiles[4].ram;
-                        cand_r[npid].branch_points = profiles[4].branch;
-                        cand_r[npid].score = sc;
-                        if (sc < best_sc) { best_sc = sc; best_idx = npid; }
-                        npid++;
+            /* GP result (already computed in results[0]) */
+            ControllerResult gp_res = results[0];
+            double dso_wcet, dso_jitter;
+            controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
+                                         profiles[4].branch, &dso_wcet, &dso_jitter);
+            gp_res.wcet_us = dso_wcet;
+            gp_res.jitter_us = dso_jitter;
+            gp_res.cycles = profiles[4].cycles;
+            gp_res.ram_bytes = profiles[4].ram;
+            gp_res.branch_points = profiles[4].branch;
+            gp_res.score = controller_score(gp_res.iae, gp_res.overshoot,
+                                             gp_res.energy, dso_wcet, dso_jitter);
+
+            /* Does GP controller pass the contract? */
+            int gp_ok = contract_pass(&c_default, &gp_res, steps,
+                                       profiles[4].cycles, profiles[4].ram);
+
+            if (gp_ok) {
+                /* Use GP as DSO plan */
+                results[4] = gp_res;
+            } else {
+                /* Fallback: best PID with DSO resource profile */
+                double best_sc = 1e100;
+                int best_idx = -1;
+                ControllerResult cand_r[36];
+                int npid = 0;
+                double kp_list[] = {0.8, 1.3, 2.0, 2.9};
+                double ki_list[] = {0.0, 0.12, 0.28};
+                double kd_list[] = {0.0, 0.08, 0.20};
+                for (int ip = 0; ip < 4; ip++) {
+                    for (int ii = 0; ii < 3; ii++) {
+                        for (int id = 0; id < 3; id++) {
+                            ControllerResult r = pid_simulate(kp_list[ip], ki_list[ii], kd_list[id],
+                                                              &plant, steps, dt, &ws);
+                            double wcet, jitter;
+                            controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
+                                                         profiles[4].branch, &wcet, &jitter);
+                            double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                            cand_r[npid] = r;
+                            cand_r[npid].wcet_us = wcet;
+                            cand_r[npid].jitter_us = jitter;
+                            cand_r[npid].cycles = profiles[4].cycles;
+                            cand_r[npid].ram_bytes = profiles[4].ram;
+                            cand_r[npid].branch_points = profiles[4].branch;
+                            cand_r[npid].score = sc;
+                            if (sc < best_sc) { best_sc = sc; best_idx = npid; }
+                            npid++;
+                        }
                     }
                 }
+                results[4] = cand_r[best_idx];
             }
-            results[4] = cand_r[best_idx];
         }
 
         /* Set resource metrics + score for all controllers */
@@ -357,6 +497,14 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         }
     }
 
+    /* Write CSV if requested */
+    if (csv_out_path) {
+        write_benchmark_csv(csv_out_path, n_worlds,
+                            (double**)all_scores, (double**)all_iae,
+                            (double**)all_os, (double**)all_en,
+                            (int**)all_sat, (int**)all_cpass);
+    }
+
     for (int ci = 0; ci < N_CONTROLLERS; ci++) {
         free(all_scores[ci]);
         free(all_iae[ci]);
@@ -365,6 +513,32 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         free(all_sat[ci]);
         free(all_cpass[ci]);
     }
+}
+
+/* ─── Write benchmark CSV ────────────────────────────────────── */
+static void write_benchmark_csv(const char *path, int n_worlds,
+                                 double **scores, double **iaes,
+                                 double **oss, double **ens,
+                                 int **sats, int **cpass)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "Can't write %s\n", path); return; }
+    fprintf(f, "world");
+    for (int ci = 0; ci < N_CONTROLLERS; ci++)
+        fprintf(f, ",%s_score,%s_iae,%s_os,%s_en,%s_sat,%s_contract",
+                profiles[ci].name, profiles[ci].name, profiles[ci].name,
+                profiles[ci].name, profiles[ci].name, profiles[ci].name);
+    fprintf(f, "\n");
+    for (int w = 0; w < n_worlds; w++) {
+        fprintf(f, "%d", w);
+        for (int ci = 0; ci < N_CONTROLLERS; ci++)
+            fprintf(f, ",%.6f,%.6f,%.6f,%.6f,%d,%d",
+                    scores[ci][w], iaes[ci][w], oss[ci][w], ens[ci][w],
+                    sats[ci][w], cpass[ci][w]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    printf("\nSaved benchmark CSV: %s\n", path);
 }
 
 /* ─── Multi-seed sweep ────────────────────────────────────────── */
@@ -383,7 +557,7 @@ static void run_sweep(int start_seed, int n_seeds, int n_worlds,
         GpPopulation pop = {0};
         gp_evolve(&pop, pop_size, generations, max_depth,
                   mut_rate, cross_rate, tournament_size,
-                  n_worlds, steps, dt, bloat_penalty, seed);
+                  n_worlds, steps, dt, bloat_penalty, seed, NULL);
 
         /* Run benchmark with best tree */
         for (int w = 0; w < n_worlds; w++) {
@@ -423,9 +597,14 @@ int main(int argc, char **argv) {
     uint64_t seed = (uint64_t)time(NULL);
     const char *export_c = NULL;
     const char *export_ada = NULL;
+    const char *gen_log_path = NULL;
+    const char *csv_out_path = NULL;
+    const char *plot_path = NULL;
     int benchmark = 0;
     int sweep_start = 0, sweep_count = 0;
     int json_mode = 0;
+    int verify = 0;
+    int stability_worlds = 0;
     double bloat_penalty = 0.01;
 
     /* Parse args */
@@ -448,6 +627,11 @@ int main(int argc, char **argv) {
             if (i+2 < argc) { sweep_start = atoi(argv[++i]); sweep_count = atoi(argv[++i]); }
             else { fprintf(stderr, "--sweep needs START COUNT\n"); return 1; }
         }
+        else if (strcmp(argv[i], "--gen-log") == 0 && i+1 < argc) gen_log_path = argv[++i];
+        else if (strcmp(argv[i], "--csv-out") == 0 && i+1 < argc) csv_out_path = argv[++i];
+        else if (strcmp(argv[i], "--plot") == 0 && i+1 < argc) plot_path = argv[++i];
+        else if (strcmp(argv[i], "--stability") == 0 && i+1 < argc) stability_worlds = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--verify") == 0)     verify = 1;
         else if (strcmp(argv[i], "--json") == 0)     json_mode = 1;
         else if (strcmp(argv[i], "--bloat") == 0 && i+1 < argc) bloat_penalty = atof(argv[++i]);
         else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
@@ -473,9 +657,11 @@ int main(int argc, char **argv) {
     printf("\n");
 
     fflush(stdout);
+    FILE *gen_log = gen_log_path ? fopen(gen_log_path, "w") : NULL;
     gp_evolve(&pop, pop_size, generations, max_depth,
               mut_rate, cross_rate, tournament_size,
-              n_worlds, steps, dt, bloat_penalty, seed);
+              n_worlds, steps, dt, bloat_penalty, seed, gen_log);
+    if (gen_log) fclose(gen_log);
 
     printf("\n=== Best controller ===\n");
     printf("Fitness score: %.6f (lower is better)\n", pop.trees[0].fitness);
@@ -507,7 +693,29 @@ int main(int argc, char **argv) {
 
     /* Benchmark */
     if (benchmark > 0) {
-        run_benchmark(benchmark, steps, dt, seed, &pop.trees[0], json_mode);
+        run_benchmark(benchmark, steps, dt, seed, &pop.trees[0], json_mode, csv_out_path);
+    }
+
+    /* Plot script */
+    if (plot_path && gen_log_path) {
+        write_plot_script(plot_path, gen_log_path, generations);
+    } else if (plot_path && !gen_log_path) {
+        fprintf(stderr, "--plot requires --gen-log\n");
+    }
+
+    /* Stability analysis */
+    if (stability_worlds > 0) {
+        StabilityReport sr = stability_analyze(stability_worlds, steps*2, dt,
+                                                 seed + 99999, 0.30,
+                                                 (void*)&pop.trees[0], tree_eval_wrap);
+        stability_print(&sr, "GP");
+    }
+
+    /* Verify with GNATprove */
+    if (verify && export_ada) {
+        run_gnatprove(export_ada);
+    } else if (verify && !export_ada) {
+        fprintf(stderr, "--verify requires --export-ada\n");
     }
 
     /* Cleanup */

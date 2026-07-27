@@ -14,6 +14,7 @@ add_library(gp_core STATIC
     gp_evolve.c
     gp_export.c
     controllers.c
+    stability.c
 )
 
 target_include_directories(gp_core PUBLIC .)

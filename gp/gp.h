@@ -134,11 +134,12 @@ double gp_fitness(GpTree *t, int n_worlds, int steps, double dt,
  *
  * After run, pop->trees[0] is the best individual.
  */
+/* If gen_log is non-NULL, writes CSV: gen,best_fitness,avg_top5 */
 void gp_evolve(GpPopulation *pop, int pop_size, int generations,
                int max_depth, double mut_rate, double cross_rate,
                int tournament_size,
                int n_worlds, int steps, double dt,
-               double bloat, uint64_t seed);
+               double bloat, uint64_t seed, FILE *gen_log);
 
 /* ================================================================
  * Export
