@@ -3,6 +3,7 @@ build/
 *.o
 *.ali
 dso_gp
+gp_controller
 
 # Generated controller files
 controller.ads

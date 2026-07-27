@@ -63,9 +63,10 @@ static int copy_subtree(GpNode *dst, int dst_start,
 void gp_tree_random(GpTree *t, int max_depth, uint64_t *rng) {
     NodeType funcs[] = {
         NODE_ADD, NODE_SUB, NODE_MUL, NODE_DIV,
-        NODE_MIN, NODE_MAX, NODE_SQ, NODE_ABS, NODE_NEG
+        NODE_MIN, NODE_MAX, NODE_SQ, NODE_ABS, NODE_NEG,
+        NODE_SIN, NODE_COS
     };
-    int n_funcs = 9;
+    int n_funcs = 11;
     NodeType terms[] = {
         NODE_CONST, NODE_ERROR, NODE_INTEGRAL, NODE_DERIV, NODE_Y
     };
@@ -96,7 +97,8 @@ void gp_tree_random(GpTree *t, int max_depth, uint64_t *rng) {
             t->nodes[pos].value = (ty == NODE_CONST) ? runif(rng, -2.0, 2.0) : 0.0;
         } else {
             NodeType ty = funcs[rint_range(rng, 0, n_funcs - 1)];
-            int is_unary = (ty == NODE_SQ || ty == NODE_ABS || ty == NODE_NEG);
+            int is_unary = (ty == NODE_SQ || ty == NODE_ABS || ty == NODE_NEG ||
+                            ty == NODE_SIN || ty == NODE_COS);
         if (next >= GP_MAX_NODES - 2) {
             /* Not enough room — force terminal */
             if (next >= GP_MAX_NODES) next = GP_MAX_NODES - 1;
@@ -222,6 +224,12 @@ double gp_tree_eval(const GpTree *t, double error, double integral,
                 case NODE_NEG:
                     val[idx] = -(l >= 0 && l < sz ? val[l] : 0);
                     break;
+                case NODE_SIN:
+                    val[idx] = sin(l >= 0 && l < sz ? val[l] : 0);
+                    break;
+                case NODE_COS:
+                    val[idx] = cos(l >= 0 && l < sz ? val[l] : 0);
+                    break;
                 default:
                     val[idx] = 0.0;
                     break;
@@ -287,8 +295,9 @@ void gp_tree_mutate(GpTree *t, int max_depth, uint64_t *rng) {
         if (free_slots < 2) {
             /* Just change the op type */
             NodeType funcs[] = {NODE_ADD,NODE_SUB,NODE_MUL,NODE_DIV,
-                                NODE_MIN,NODE_MAX,NODE_SQ,NODE_ABS,NODE_NEG};
-            n->type = funcs[rint_range(rng, 0, 8)];
+                                NODE_MIN,NODE_MAX,NODE_SQ,NODE_ABS,NODE_NEG,
+                                NODE_SIN,NODE_COS};
+            n->type = funcs[rint_range(rng, 0, 10)];
             return;
         }
 
@@ -384,6 +393,16 @@ static void print_rec(const GpTree *t, int idx, char *buf, int cap) {
             break;
         case NODE_NEG:
             strncat(buf, "(- ", cap - strlen(buf) - 1);
+            print_rec(t, n->left, buf, cap);
+            strncat(buf, ")", cap - strlen(buf) - 1);
+            break;
+        case NODE_SIN:
+            strncat(buf, "(sin ", cap - strlen(buf) - 1);
+            print_rec(t, n->left, buf, cap);
+            strncat(buf, ")", cap - strlen(buf) - 1);
+            break;
+        case NODE_COS:
+            strncat(buf, "(cos ", cap - strlen(buf) - 1);
             print_rec(t, n->left, buf, cap);
             strncat(buf, ")", cap - strlen(buf) - 1);
             break;

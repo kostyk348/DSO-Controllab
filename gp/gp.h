@@ -35,6 +35,8 @@ typedef enum {
     NODE_MIN, NODE_MAX,
     /* Unary functions */
     NODE_SQ,  NODE_ABS, NODE_NEG,
+    /* Trigonometric (unary) */
+    NODE_SIN, NODE_COS,
     /* Terminals */
     NODE_CONST,
     NODE_ERROR, NODE_INTEGRAL, NODE_DERIV, NODE_Y,
