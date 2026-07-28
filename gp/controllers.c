@@ -283,10 +283,62 @@ ControllerResult mpc_simulate(const Plant *plant, int steps, double dt,
 }
 
 /* ================================================================
- * DSO = best PID from bank (matches Python DSO plan logic)
+ * Lead-Lag compensator (ultra-light: 2 cycles, 0 branches)
+ *
+ *   C(s) = k * (s + z) / (s + p)
+ *   Tustin: u[k] = b0*e[k] + b1*e[k-1] - a1*u[k-1]
  * ================================================================ */
 
-/* PID candidate bank: 4 kp × 3 ki × 3 kd = 36 candidates */
+typedef struct {
+    double b0, b1, a1;  /* difference equation coefficients */
+    double e_prev, u_prev;
+} LeadLagCtx;
+
+static void leadlag_init(LeadLagCtx *ll, double k, double z, double p, double dt) {
+    /* Tustin discretization of k*(s+z)/(s+p) */
+    double denom = 2.0 + p * dt;
+    ll->b0 = k * (2.0 + z * dt) / denom;
+    ll->b1 = k * (z * dt - 2.0) / denom;
+    ll->a1 = (p * dt - 2.0) / denom;
+    ll->e_prev = 0;
+    ll->u_prev = 0;
+}
+
+static double leadlag_compute(void *ctx, ControllerState *st, double y, double dt) {
+    (void)dt;
+    LeadLagCtx *ll = (LeadLagCtx*)ctx;
+    double error = st->target - y;
+    double u = ll->b0 * error + ll->b1 * ll->e_prev - ll->a1 * ll->u_prev;
+    ll->e_prev = error;
+    ll->u_prev = u;
+    return clamp_val(u, -4.0, 4.0);
+}
+
+ControllerResult leadlag_simulate(double k, double z, double p,
+                                   const Plant *plant, int steps, double dt,
+                                   uint64_t *seed)
+{
+    LeadLagCtx ll;
+    leadlag_init(&ll, k, z, p, dt);
+    ControllerResult r = simulate_with(plant, steps, dt, seed, &ll, leadlag_compute);
+    r.controller_tier = 3;
+    return r;
+}
+
+/* ================================================================
+ * DSO — DataSpace OS Controller Runtime
+ *
+ * Multi-tier adaptive controller with plant fingerprinting
+ * and online learning from past deployments.
+ *
+ * Tiers (lowest resource first):
+ *   0: GP library  (evolved trees, 0 branch points)
+ *   1: LQR         (computed via DARE)
+ *   2: PID         (best-of-36 from candidate bank)
+ *   3: Lead-Lag    (2 cycles, failsafe)
+ * ================================================================ */
+
+/* ─── PID candidate bank ──────────────────────────────────────── */
 static const double dso_kp_list[] = {0.8, 1.3, 2.0, 2.9};
 static const double dso_ki_list[] = {0.0, 0.12, 0.28};
 static const double dso_kd_list[] = {0.0, 0.08, 0.20};
@@ -294,42 +346,274 @@ static const double dso_kd_list[] = {0.0, 0.08, 0.20};
 #define DSO_N_KI 3
 #define DSO_N_KD 3
 
-ControllerResult dso_simulate(const Plant *plant, int steps, double dt,
-                               uint64_t *seed)
-{
-    /* Try all 36 PID candidates, pick best score */
-    double best_score = 1e100;
-    ControllerResult best = {0};
+/* ─── Default resource profiles per tier ──────────────────────── */
+static const int default_cycles[4]  = {42, 58, 42, 2};
+static const int default_ram[4]     = {40, 64, 40, 8};
+static const int default_branch[4]  = {1,  1,  1,  0};
 
-    double total_time = steps * dt;
-    for (int ip = 0; ip < DSO_N_KP; ip++) {
-        for (int ii = 0; ii < DSO_N_KI; ii++) {
-            for (int id = 0; id < DSO_N_KD; id++) {
-                double kp = dso_kp_list[ip];
-                double ki = dso_ki_list[ii];
-                double kd = dso_kd_list[id];
-                ControllerResult r = pid_simulate(kp, ki, kd, plant, steps, dt, seed);
-                double wcet, jitter;
-                controller_resource_metrics(32, 36, 0, &wcet, &jitter);
-                double sc = controller_score(r.itae, total_time, r.overshoot, r.energy,
-                                              r.settling_time, wcet, jitter);
-                if (sc < best_score) {
-                    best_score = sc;
-                    best = r;
+/* ─── Plant fingerprint ──────────────────────────────────────────
+ * Quantize plant parameters and hash to 64 bits.
+ * Two plants with similar dynamics get the SAME fingerprint.
+ * ──────────────────────────────────────────────────────────────── */
+DsoFingerprint dso_fingerprint(const Plant *p) {
+    /* Quantize: map continuous params to discrete bins */
+    int wn_bin    = (int)((p->wn    - 0.5) / 0.5);      /* 0.5–5.0 → bins */
+    int zeta_bin  = (int)((p->zeta  - 0.1) / 0.15);     /* 0.1–2.0 → bins */
+    int gain_bin  = (int)((p->gain  - 0.1) / 0.3);      /* 0.1–3.0 → bins */
+    int delay_bin = p->delay_steps;
+
+    if (wn_bin   < 0)   wn_bin   = 0;
+    if (wn_bin   > 15)  wn_bin   = 15;
+    if (zeta_bin < 0)   zeta_bin = 0;
+    if (zeta_bin > 15)  zeta_bin = 15;
+    if (gain_bin < 0)   gain_bin = 0;
+    if (gain_bin > 15)  gain_bin = 15;
+    if (delay_bin < 0)  delay_bin = 0;
+    if (delay_bin > 15) delay_bin = 15;
+
+    /* Pack into 64-bit: 16 bits each */
+    return ((DsoFingerprint)wn_bin   << 48)
+         | ((DsoFingerprint)zeta_bin << 32)
+         | ((DsoFingerprint)gain_bin << 16)
+         | ((DsoFingerprint)delay_bin);
+}
+
+/* ─── Default config ──────────────────────────────────────────── */
+void dso_config_init(DsoConfig *cfg, GpTree *gp_library, int n_gp,
+                     double (*eval_fn)(void*,double,double,double,double))
+{
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->gp_library   = gp_library;
+    cfg->n_gp_library = n_gp;
+    cfg->eval_fn      = eval_fn;
+    for (int i = 0; i < 4; i++) {
+        cfg->cycles[i] = default_cycles[i];
+        cfg->ram[i]    = default_ram[i];
+        cfg->branch[i] = default_branch[i];
+    }
+}
+
+/* ─── Internal: run a specific tier ───────────────────────────── */
+static ControllerResult dso_run_tier(DsoConfig *cfg, int tier,
+                                      const Plant *plant, int steps, double dt,
+                                      uint64_t *seed,
+                                      int gp_idx, const double K_lqr[2],
+                                      double kp, double ki, double kd,
+                                      double k_lead, double z_lead, double p_lead)
+{
+    ControllerResult r;
+    memset(&r, 0, sizeof(r));
+
+    switch (tier) {
+        case 0: { /* GP library */
+            if (gp_idx < 0 || gp_idx >= cfg->n_gp_library) {
+                memset(&r, 0, sizeof(r));
+                r.score = 1e10;
+                return r;
+            }
+            r = gp_simulate((void*)&cfg->gp_library[gp_idx], plant, steps, dt, seed, cfg->eval_fn);
+            break;
+        }
+        case 1: { /* LQR */
+            double K[2] = {K_lqr[0], K_lqr[1]};
+            r = lqr_simulate(K, plant, steps, dt, seed);
+            break;
+        }
+        case 2: { /* PID — best-of-36 */
+            double best_sc = 1e100;
+            double total_time = steps * dt;
+            for (int ip = 0; ip < DSO_N_KP; ip++) {
+                for (int ii = 0; ii < DSO_N_KI; ii++) {
+                    for (int id = 0; id < DSO_N_KD; id++) {
+                        ControllerResult cr = pid_simulate(
+                            dso_kp_list[ip], dso_ki_list[ii], dso_kd_list[id],
+                            plant, steps, dt, seed);
+                        double wcet, jitter;
+                        controller_resource_metrics(cfg->cycles[tier], cfg->ram[tier],
+                                                     cfg->branch[tier], &wcet, &jitter);
+                        double sc = controller_score(cr.itae, total_time,
+                                                      cr.overshoot, cr.energy,
+                                                      cr.settling_time, wcet, jitter);
+                        if (sc < best_sc) {
+                            best_sc = sc;
+                            r = cr;
+                            kp = dso_kp_list[ip];
+                            ki = dso_ki_list[ii];
+                            kd = dso_kd_list[id];
+                        }
+                    }
                 }
             }
+            break;
+        }
+        case 3: { /* Lead-Lag */
+            r = leadlag_simulate(k_lead, z_lead, p_lead, plant, steps, dt, seed);
+            break;
+        }
+        default:
+            r.score = 1e10;
+            return r;
+    }
+
+    /* Apply resource metrics */
+    double wcet, jitter;
+    controller_resource_metrics(cfg->cycles[tier], cfg->ram[tier],
+                                 cfg->branch[tier], &wcet, &jitter);
+    r.wcet_us = wcet;
+    r.jitter_us = jitter;
+    r.cycles = cfg->cycles[tier];
+    r.ram_bytes = cfg->ram[tier];
+    r.branch_points = cfg->branch[tier];
+    r.controller_tier = tier;
+
+    double total_time = steps * dt;
+    r.score = controller_score(r.itae, total_time, r.overshoot, r.energy,
+                                r.settling_time, r.wcet_us, r.jitter_us);
+    return r;
+}
+
+/* ─── DSO simulate — main entry ──────────────────────────────────
+ *
+ * 1. Fingerprint the plant
+ * 2. Check bank cache → if found, try cached tier first
+ * 3. If miss or cache fails → try tiers 0→3 in order
+ * 4. Pick first tier that passes contract
+ * 5. Learn: update bank entry
+ * ──────────────────────────────────────────────────────────────── */
+ControllerResult dso_simulate(DsoConfig *cfg,
+                               const Plant *plant, int steps, double dt,
+                               uint64_t *seed)
+{
+    DsoFingerprint fp = dso_fingerprint(plant);
+    cfg->deploy_count++;
+
+    /* Contract (matching Python DeploymentContract) */
+    double total_time = steps * dt;
+    double iae_max = 5.0;
+    double overshoot_max = 1.0;
+    double sat_frac_max = 0.45;
+    double final_error_tol = 1.25;
+
+    /* ── Step 1: Look up cache ───────────────────────────────── */
+    DsoBankEntry *cached = NULL;
+    for (int i = 0; i < cfg->n_bank; i++) {
+        if (cfg->bank[i].fp == fp) {
+            cached = &cfg->bank[i];
+            cfg->cache_hits++;
+            break;
         }
     }
 
-    /* DSO uses fixed resource profile */
-    best.cycles = 32;
-    best.ram_bytes = 36;
-    best.branch_points = 0;
-    double total_time2 = steps * dt;
-    controller_resource_metrics(32, 36, 0, &best.wcet_us, &best.jitter_us);
-    best.score = controller_score(best.itae, total_time2, best.overshoot, best.energy,
-                                   best.settling_time, best.wcet_us, best.jitter_us);
+    int start_tier = 0;
+    int gp_idx = -1;
+    double K_lqr[2] = {0, 0};
+    double kp = 0, ki = 0, kd = 0;
+    double k_lead = 1.0, z_lead = 5.0, p_lead = 10.0;
+
+    if (cached) {
+        start_tier = cached->tier;
+        gp_idx = cached->gp_idx;
+        K_lqr[0] = cached->K_lqr[0];
+        K_lqr[1] = cached->K_lqr[1];
+        kp = cached->kp; ki = cached->ki; kd = cached->kd;
+        k_lead = cached->k_lead; z_lead = cached->z_lead; p_lead = cached->p_lead;
+    }
+
+    /* ── Step 2: Try tiers from start_tier upward ────────────── */
+    ControllerResult best;
+    memset(&best, 0, sizeof(best));
+    best.score = 1e10;
+
+    for (int tier = start_tier; tier < 4; tier++) {
+        int try_gp_idx = (tier == 0) ? gp_idx : -1;
+        if (tier == 0 && try_gp_idx < 0) {
+            /* No cached GP — try all GP trees in library */
+            for (int gi = 0; gi < cfg->n_gp_library; gi++) {
+                ControllerResult r = dso_run_tier(cfg, 0, plant, steps, dt,
+                                                   seed, gi, NULL, 0,0,0, 0,0,0);
+                if (r.score < best.score) {
+                    best = r;
+                    gp_idx = gi;
+                }
+            }
+            if (best.score < 1e9) {
+                /* Check basic contract */
+                if (best.iae < iae_max &&
+                    best.overshoot < overshoot_max &&
+                    (double)best.saturated / steps < sat_frac_max) {
+                    goto done;
+                }
+            }
+            continue;
+        }
+
+        /* Compute LQR gain on-demand */
+        if (tier == 1 && K_lqr[0] == 0 && K_lqr[1] == 0) {
+            lqr_compute_gain(plant, dt, K_lqr);
+        }
+
+        ControllerResult r = dso_run_tier(cfg, tier, plant, steps, dt,
+                                           seed, try_gp_idx, K_lqr,
+                                           kp, ki, kd, k_lead, z_lead, p_lead);
+
+        /* Accept if this tier's result is the best so far */
+        if (r.score < best.score) {
+            best = r;
+        }
+
+        /* Check contract: if passes, deploy this tier */
+        if (r.iae < iae_max &&
+            r.overshoot < overshoot_max &&
+            (double)r.saturated / steps < sat_frac_max &&
+            r.settling_time < total_time * 0.95) {
+            best = r;
+            goto done;
+        }
+    }
+
+done:
+    /* ── Step 3: Learn ───────────────────────────────────────── */
+    if (cached) {
+        cached->hit_count++;
+        if (best.score < cached->best_score || cached->best_score < 0.1) {
+            cached->best_score = best.score;
+            cached->tier = best.controller_tier;
+        }
+    } else if (cfg->n_bank < DSO_BANK_MAX) {
+        DsoBankEntry *e = &cfg->bank[cfg->n_bank++];
+        e->fp = fp;
+        e->tier = best.controller_tier;
+        e->gp_idx = (best.controller_tier == 0) ? gp_idx : -1;
+        if (best.controller_tier == 1) { e->K_lqr[0] = K_lqr[0]; e->K_lqr[1] = K_lqr[1]; }
+        e->kp = kp; e->ki = ki; e->kd = kd;
+        e->k_lead = k_lead; e->z_lead = z_lead; e->p_lead = p_lead;
+        e->best_score = best.score;
+        e->hit_count = 1;
+    }
+
     return best;
+}
+
+/* ─── Learn (external call to update bank with known result) ──── */
+void dso_learn(DsoConfig *cfg, DsoFingerprint fp, const ControllerResult *result)
+{
+    for (int i = 0; i < cfg->n_bank; i++) {
+        if (cfg->bank[i].fp == fp) {
+            cfg->bank[i].hit_count++;
+            if (result->score < cfg->bank[i].best_score || cfg->bank[i].best_score < 0.1) {
+                cfg->bank[i].best_score = result->score;
+                cfg->bank[i].tier = result->controller_tier;
+            }
+            return;
+        }
+    }
+    if (cfg->n_bank < DSO_BANK_MAX) {
+        DsoBankEntry *e = &cfg->bank[cfg->n_bank++];
+        e->fp = fp;
+        e->tier = result->controller_tier;
+        e->best_score = result->score;
+        e->hit_count = 1;
+    }
 }
 
 /* ================================================================

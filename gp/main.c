@@ -217,8 +217,8 @@ static const CtrlProfile profiles[] = {
 #define N_CONTROLLERS 5
 
 static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
-                          const GpTree *best_gp, int json_mode,
-                          const char *csv_out_path)
+                           DsoConfig *dso_cfg, int json_mode,
+                           const char *csv_out_path)
 {
     Contract c_default = {
         .cycles_max = 180,
@@ -263,7 +263,8 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         /* Run each controller */
         ControllerResult results[N_CONTROLLERS];
 
-        /* GP */
+        /* GP (use best from DSO library) */
+        const GpTree *best_gp = (dso_cfg && dso_cfg->n_gp_library > 0) ? &dso_cfg->gp_library[0] : NULL;
         results[0] = gp_simulate((void*)best_gp, &plant, steps, dt, &ws, tree_eval_wrap);
 
         /* PID: find best PID for this world (36 candidates) */
@@ -305,61 +306,8 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         /* MPC */
         results[3] = mpc_simulate(&plant, steps, dt, &ws);
 
-        /* DSO: try GP first, verify against contract, fallback to best PID */
-        {
-            /* GP result (already computed in results[0]) */
-            ControllerResult gp_res = results[0];
-            double dso_wcet, dso_jitter;
-            controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
-                                         profiles[4].branch, &dso_wcet, &dso_jitter);
-            gp_res.wcet_us = dso_wcet;
-            gp_res.jitter_us = dso_jitter;
-            gp_res.cycles = profiles[4].cycles;
-            gp_res.ram_bytes = profiles[4].ram;
-            gp_res.branch_points = profiles[4].branch;
-            gp_res.score = controller_score(gp_res.itae, total_time, gp_res.overshoot,
-                                             gp_res.energy, gp_res.settling_time, dso_wcet, dso_jitter);
-
-            /* Does GP controller pass the contract? */
-            int gp_ok = contract_pass(&c_default, &gp_res, steps,
-                                       profiles[4].cycles, profiles[4].ram);
-
-            if (gp_ok) {
-                /* Use GP as DSO plan */
-                results[4] = gp_res;
-            } else {
-                /* Fallback: best PID with DSO resource profile */
-                double best_sc = 1e100;
-                int best_idx = -1;
-                ControllerResult cand_r[36];
-                int npid = 0;
-                double kp_list[] = {0.8, 1.3, 2.0, 2.9};
-                double ki_list[] = {0.0, 0.12, 0.28};
-                double kd_list[] = {0.0, 0.08, 0.20};
-                for (int ip = 0; ip < 4; ip++) {
-                    for (int ii = 0; ii < 3; ii++) {
-                        for (int id = 0; id < 3; id++) {
-                            ControllerResult r = pid_simulate(kp_list[ip], ki_list[ii], kd_list[id],
-                                                              &plant, steps, dt, &ws);
-                            double wcet, jitter;
-                            controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
-                                                         profiles[4].branch, &wcet, &jitter);
-                            double sc = controller_score(r.itae, total_time, r.overshoot, r.energy, r.settling_time, wcet, jitter);
-                            cand_r[npid] = r;
-                            cand_r[npid].wcet_us = wcet;
-                            cand_r[npid].jitter_us = jitter;
-                            cand_r[npid].cycles = profiles[4].cycles;
-                            cand_r[npid].ram_bytes = profiles[4].ram;
-                            cand_r[npid].branch_points = profiles[4].branch;
-                            cand_r[npid].score = sc;
-                            if (sc < best_sc) { best_sc = sc; best_idx = npid; }
-                            npid++;
-                        }
-                    }
-                }
-                results[4] = cand_r[best_idx];
-            }
-        }
+        /* DSO: multi-tier with plant fingerprinting + GP library */
+        results[4] = dso_simulate(dso_cfg, &plant, steps, dt, &ws);
 
         /* Set resource metrics + score for all controllers */
         for (int ci = 0; ci < N_CONTROLLERS; ci++) {
@@ -698,9 +646,24 @@ int main(int argc, char **argv) {
         if (fb) { gp_export_ada_body(&pop.trees[0], "Compute", fb); fclose(fb); printf("Exported Ada body: %s\n", adb); }
     }
 
+    /* ── Build DSO config with top-5 GP trees ────────────────── */
+    #define DSO_GP_LIBRARY_SIZE 5
+    GpTree dso_gp_lib[DSO_GP_LIBRARY_SIZE];
+    int n_lib = pop_size < DSO_GP_LIBRARY_SIZE ? pop_size : DSO_GP_LIBRARY_SIZE;
+    /* Already sorted: trees[0] is best (evolution puts all-time best at 0) */
+    for (int i = 0; i < n_lib; i++) {
+        gp_tree_copy(&dso_gp_lib[i], &pop.trees[i]);
+    }
+    DsoConfig dso_cfg;
+    dso_config_init(&dso_cfg, dso_gp_lib, n_lib, tree_eval_wrap);
+
+    /* Report bank stats */
+    printf("\nDSO initialized with %d GP trees in library, %d bank slots\n",
+           n_lib, DSO_BANK_MAX);
+
     /* Benchmark */
     if (benchmark > 0) {
-        run_benchmark(benchmark, steps, dt, seed, &pop.trees[0], json_mode, csv_out_path);
+        run_benchmark(benchmark, steps, dt, seed, &dso_cfg, json_mode, csv_out_path);
     }
 
     /* Plot script */
