@@ -249,6 +249,7 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
         all_cpass[ci]   = (int*)calloc(n_worlds, sizeof(int));
     }
 
+    double total_time = steps * dt;
     double sum_score[N_CONTROLLERS] = {0};
 
     for (int w = 0; w < n_worlds; w++) {
@@ -282,7 +283,7 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
                         double wcet, jitter;
                         controller_resource_metrics(profiles[1].cycles, profiles[1].ram,
                                                      profiles[1].branch, &wcet, &jitter);
-                        double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                        double sc = controller_score(r.itae, total_time, r.overshoot, r.energy, r.settling_time, wcet, jitter);
                         cand_r[npid] = r;
                         cand_r[npid].wcet_us = wcet;
                         cand_r[npid].jitter_us = jitter;
@@ -316,8 +317,8 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
             gp_res.cycles = profiles[4].cycles;
             gp_res.ram_bytes = profiles[4].ram;
             gp_res.branch_points = profiles[4].branch;
-            gp_res.score = controller_score(gp_res.iae, gp_res.overshoot,
-                                             gp_res.energy, dso_wcet, dso_jitter);
+            gp_res.score = controller_score(gp_res.itae, total_time, gp_res.overshoot,
+                                             gp_res.energy, gp_res.settling_time, dso_wcet, dso_jitter);
 
             /* Does GP controller pass the contract? */
             int gp_ok = contract_pass(&c_default, &gp_res, steps,
@@ -343,7 +344,7 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
                             double wcet, jitter;
                             controller_resource_metrics(profiles[4].cycles, profiles[4].ram,
                                                          profiles[4].branch, &wcet, &jitter);
-                            double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                            double sc = controller_score(r.itae, total_time, r.overshoot, r.energy, r.settling_time, wcet, jitter);
                             cand_r[npid] = r;
                             cand_r[npid].wcet_us = wcet;
                             cand_r[npid].jitter_us = jitter;
@@ -369,7 +370,13 @@ static void run_benchmark(int n_worlds, int steps, double dt, uint64_t seed,
                 r->cycles = profiles[ci].cycles;
                 r->ram_bytes = profiles[ci].ram;
                 r->branch_points = profiles[ci].branch;
-                r->score = controller_score(r->iae, r->overshoot, r->energy,
+                r->score = controller_score(r->itae, total_time, r->overshoot,
+                                             r->energy, r->settling_time,
+                                             r->wcet_us, r->jitter_us);
+            } else if (ci == 1 || ci == 4) {
+                /* PID and DSO already have score; recompute with consistent formula */
+                r->score = controller_score(r->itae, total_time, r->overshoot,
+                                             r->energy, r->settling_time,
                                              r->wcet_us, r->jitter_us);
             }
         }

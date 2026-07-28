@@ -27,10 +27,14 @@ static ControllerResult simulate_with(
     st.prev_error = 0.0;
     st.last_y = 0.0;
 
-    double iae = 0, overshoot = 0, energy = 0;
+    double iae = 0, itae = 0, overshoot = 0, energy = 0;
     int saturated = 0;
+    double total_time = steps * dt;
+    double settling_time = total_time;  /* last time |error| > 2% */
+    int has_settled = 0;
 
     for (int s = 0; s < steps; s++) {
+        double t = s * dt;
         double u = compute(ctrl_ctx, &st, y, dt);
         if (u >= 3.999 || u <= -3.999) saturated++;
 
@@ -39,15 +43,30 @@ static ControllerResult simulate_with(
         x[0] = x_next[0];
         x[1] = x_next[1];
 
-        iae += fabs(st.target - y) * dt;
+        double error = fabs(st.target - y);
+        iae += error * dt;
+        itae += error * t * dt;          /* time-weighted IAE */
         energy += u * u;
         if (y - st.target > overshoot) overshoot = y - st.target;
+
+        /* Settling detection: error within ±2% of target */
+        if (!has_settled) {
+            if (error < 0.02 * st.target) {
+                has_settled = 1;
+                settling_time = t;
+            }
+        } else if (error > 0.02 * st.target) {
+            has_settled = 0;  /* un-settle if kicked out */
+            settling_time = total_time;
+        }
     }
 
     ControllerResult r;
     r.iae = iae;
+    r.itae = itae;
     r.overshoot = overshoot > 0 ? overshoot : 0;
     r.energy = energy / steps;
+    r.settling_time = has_settled ? settling_time : total_time;
     r.saturated = saturated;
     return r;
 }
@@ -282,6 +301,7 @@ ControllerResult dso_simulate(const Plant *plant, int steps, double dt,
     double best_score = 1e100;
     ControllerResult best = {0};
 
+    double total_time = steps * dt;
     for (int ip = 0; ip < DSO_N_KP; ip++) {
         for (int ii = 0; ii < DSO_N_KI; ii++) {
             for (int id = 0; id < DSO_N_KD; id++) {
@@ -291,7 +311,8 @@ ControllerResult dso_simulate(const Plant *plant, int steps, double dt,
                 ControllerResult r = pid_simulate(kp, ki, kd, plant, steps, dt, seed);
                 double wcet, jitter;
                 controller_resource_metrics(32, 36, 0, &wcet, &jitter);
-                double sc = controller_score(r.iae, r.overshoot, r.energy, wcet, jitter);
+                double sc = controller_score(r.itae, total_time, r.overshoot, r.energy,
+                                              r.settling_time, wcet, jitter);
                 if (sc < best_score) {
                     best_score = sc;
                     best = r;
@@ -304,9 +325,10 @@ ControllerResult dso_simulate(const Plant *plant, int steps, double dt,
     best.cycles = 32;
     best.ram_bytes = 36;
     best.branch_points = 0;
+    double total_time2 = steps * dt;
     controller_resource_metrics(32, 36, 0, &best.wcet_us, &best.jitter_us);
-    best.score = controller_score(best.iae, best.overshoot, best.energy,
-                                   best.wcet_us, best.jitter_us);
+    best.score = controller_score(best.itae, total_time2, best.overshoot, best.energy,
+                                   best.settling_time, best.wcet_us, best.jitter_us);
     return best;
 }
 

@@ -16,11 +16,13 @@ extern "C" {
  * ================================================================ */
 
 typedef struct {
-    double iae;
+    double iae;            /* integral absolute error */
+    double itae;           /* time-weighted IAE: sum(t * |error| * dt) */
     double overshoot;
     double energy;         /* mean(u^2) over steps */
+    double settling_time;  /* seconds until error stays within ±2% */
     int    saturated;      /* count of steps where |u| >= 3.999 */
-    double score;          /* combined: iae + 0.35*os + 0.04*energy + 0.12*wcet + 0.9*jitter */
+    double score;          /* combined: itae/T + 0.3*os + 0.08*energy + 0.005*settle + 0.12*wcet + 0.9*jitter */
     double wcet_us;
     double jitter_us;
     int    cycles;
@@ -36,10 +38,16 @@ static inline void controller_resource_metrics(int cycles, int ram_bytes, int br
     *out_jitter = 0.04 + 0.055 * branch_points; /* Python: 0.04 + 0.055 * branch_points */
 }
 
-/* ─── Score (matching Python score()) ─────────────────────────── */
-static inline double controller_score(double iae, double overshoot, double energy,
+/* ─── Score (itae-centered: ITAE + overshoot + energy + settling + resources) ─── */
+static inline double controller_score(double itae, double total_time,
+                                       double overshoot, double energy,
+                                       double settling_time,
                                        double wcet_us, double jitter_us) {
-    return iae + 0.35 * overshoot + 0.04 * energy + 0.12 * wcet_us + 0.9 * jitter_us;
+    double itae_norm = itae / total_time;        /* mean time-weighted error */
+    double settle_penalty = 0.005 * settling_time; /* штраф за долгий переход */
+    return itae_norm + 0.30 * overshoot + 0.08 * energy
+         + settle_penalty
+         + 0.12 * wcet_us + 0.9 * jitter_us;
 }
 
 /* ─── Clamp ───────────────────────────────────────────────────── */

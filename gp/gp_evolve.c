@@ -24,6 +24,7 @@ double gp_fitness(GpTree *t, int n_worlds, int steps, double dt,
                   uint64_t *seed, double bloat_penalty) {
     double total_score = 0.0;
     int valid_worlds = 0;
+    double total_time = steps * dt;
 
     #pragma omp parallel for reduction(+:total_score, valid_worlds)
     for (int w = 0; w < n_worlds; w++) {
@@ -36,11 +37,15 @@ double gp_fitness(GpTree *t, int n_worlds, int steps, double dt,
         double prev_error = 0.0;
         double target = 1.0;
         double iae = 0.0;
+        double itae = 0.0;
         double overshoot = 0.0;
         double energy = 0.0;
         int saturated = 0;
+        double settling_time = total_time;
+        int has_settled = 0;
 
         for (int s = 0; s < steps; s++) {
+            double t_sec = s * dt;
             double error = target - y;
             integral += error * dt;
             double deriv = (error - prev_error) / dt;
@@ -52,17 +57,42 @@ double gp_fitness(GpTree *t, int n_worlds, int steps, double dt,
             plant_step(&plant, x, u, dt, x_next, &y, &local_seed);
             x[0] = x_next[0]; x[1] = x_next[1];
 
-            iae += fabs(target - y) * dt;
+            double abs_err = fabs(target - y);
+            iae += abs_err * dt;
+            itae += abs_err * t_sec * dt;   /* ITAE: time-weighted */
             energy += u * u;
             if (y - target > overshoot) overshoot = y - target;
+
+            /* Settling: within ±2% of target */
+            if (!has_settled) {
+                if (abs_err < 0.02 * target) {
+                    has_settled = 1;
+                    settling_time = t_sec;
+                }
+            } else if (abs_err > 0.02 * target) {
+                has_settled = 0;  /* kicked out of band */
+                settling_time = total_time;
+            }
             prev_error = error;
         }
 
-        double score = iae
-                     + 0.35 * (overshoot > 0.0 ? overshoot : 0.0)
-                     + 0.04 * (energy / steps)
-                     + 0.02 * ((double)saturated / steps)
-                     + bloat_penalty * t->size;
+        if (!has_settled) settling_time = total_time;
+
+        /* Energy: average control power */
+        double avg_energy = energy / steps;
+        /* ITAE normalized: mean time-weighted error */
+        double itae_norm = itae / total_time;
+
+        /* Unsettled penalty: fraction of time NOT settled × total_time */
+        double unsettled_penalty = 0.005 * (total_time - settling_time);
+        if (unsettled_penalty < 0) unsettled_penalty = 0;
+
+        double score = itae_norm                       /* ITAE — time-weighted accuracy */
+                     + 0.30 * (overshoot > 0.0 ? overshoot : 0.0)  /* overshoot */
+                     + 0.08 * avg_energy               /* control energy (×2 vs old) */
+                     + unsettled_penalty                /* settling time penalty */
+                     + 0.02 * ((double)saturated / steps)  /* saturation */
+                     + bloat_penalty * t->size;         /* anti-bloat */
 
         if (!isnan(score) && !isinf(score)) {
             total_score += score;
@@ -120,6 +150,14 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
 
     /* Generation loop */
     for (int gen = 0; gen < generations; gen++) {
+        /* ── Adaptive rates ────────────────────────────────
+         * Mutation: starts high (exploration), decays to 20% of base
+         * Crossover: starts low, ramps up (refinement)
+         * ────────────────────────────────────────────────── */
+        double progress = (double)gen / generations;
+        double cur_mut   = mut_rate   * (1.0 - 0.8 * progress);   /* 100%→20% of base */
+        double cur_cross = cross_rate * (0.4 + 0.6 * progress);   /* 40%→100% of base */
+
         /* Elitism: keep best 2 */
         int elite1 = 0, elite2 = 1;
         if (trees[1].fitness < trees[0].fitness) { elite1 = 1; elite2 = 0; }
@@ -148,7 +186,7 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
                 if (trees[c].fitness < trees[p2].fitness) p2 = c;
             }
 
-            if (runif(&rng, 0, 1) < cross_rate) {
+            if (runif(&rng, 0, 1) < cur_cross) {
                 gp_tree_copy(&next_gen[i], &trees[p1]);
                 GpTree tmp;
                 gp_tree_copy(&tmp, &trees[p2]);
@@ -157,7 +195,7 @@ void gp_evolve(GpPopulation *pop, int pop_size, int generations,
                 gp_tree_copy(&next_gen[i], &trees[p1]);
             }
 
-            if (runif(&rng, 0, 1) < mut_rate) {
+            if (runif(&rng, 0, 1) < cur_mut) {
                 gp_tree_mutate(&next_gen[i], max_depth, &rng);
             }
         }
