@@ -391,7 +391,64 @@ Integrator+Delay          3.815    4.022   5.4%    18     16      6
 
 ---
 
-## 7. Ключевые выводы
+## 7. DSO Streaming Compiler (multi-rate pipelines)
+
+Модуль `racs_codegen/dso_stream.py`: компиляция **N регуляторов на разных частотах** в единый pipeline с compile-time расписанием. Никаких runtime-решений: статическая таблица фаз, статическая память.
+
+**Что вычисляется на этапе компиляции:**
+- hyperperiod = LCM(периоды) в базовых тиках (1 мс)
+- таблица расписания: tick → набор задач, готовых к запуску
+- WCET на тик = max по тикам (Σ циклов задач этого тика)
+- utilization = Σ(Cᵢ / (periodᵢ · 48000))
+- суммарная память по всем задачам + shared-переменные
+- feasibility: WCET_tick ≤ доступно на тик
+
+### 7.1 Демо: 2-rate cascade (QEMU Cortex-M4)
+
+Каскадный регулятор: внешний контур позиции (100 Гц) + внутренний контур скорости (1 кГц).
+
+```
+multi-rate (100 Hz + 1 kHz):  IAE=0.6792   avg_load=9.1 cyc/tick
+single-rate (both 1 kHz):     IAE=0.9763   avg_load=19.0 cyc/tick
+─────────────────────────────────────────────────────────────
+→ multi-rate: IAE −30.4%, avg CPU −52.1%
+```
+
+**Вывод:** multi-rate даёт **одновременно** лучшее качество (медленный контур работает на своей проектной частоте) и меньше средней нагрузки (он запускается в 10× реже). Это и есть суть DSO: правильная временная декомпозиция вместо «всё на максимальной частоте».
+
+Свойства: 11 schedule slots за hyperperiod 10 мс, 64 B RAM, 19 cyc worst-case на тик (0.04% CPU), FEASIBLE ✓.
+
+---
+
+## 8. On-Target Bayesian Optimization
+
+Модуль `racs_codegen/bo.py`: оптимизация параметров регулятора **прямо на target** (closed loop в QEMU) — без Python-модели plant.
+
+- Структура: PID `u = Kp·e + Ki·ie + Kd·de` (3 параметра)
+- Surrogate: Gaussian Process (RBF, numpy only) + Expected Improvement
+- Objective: IAE, измеренный hardware-in-the-loop
+- Бюджет: 30 on-target прогонов (12 init + 18 BO-итераций)
+
+### 8.1 Результаты (30 evals, сравнение с random search)
+
+```
+plant             BO(30)  random(30)   NSGA-II   BO gain
+──────────────────────────────────────────────────────
+Underdamped       0.4536      0.4790     1.317     +5%
+NonMinPhase      30.0000     30.0000     0.410     +0%   (PID дивергирует)
+FourthOrder       3.8120      4.1955     4.575     +9%
+```
+
+**Выводы:**
+1. BO стабильно бьёт random search при том же бюджете (+5…+9%) — surrogate-модель работает
+2. На Underdamped и FourthOrder **BO-PID обходит NSGA-II** (0.454 vs 1.317; 3.81 vs 4.58) — простая PID-структура с хорошими коэффициентами эффективнее, чем найденное GP-дерево
+3. На Non-Min Phase PID **структурно** не подходит (дивергенция) — нужна нелинейная структура, которую нашёл NSGA-II
+
+**Смысл:** on-target BO позволяет синтезировать регулятор без модели объекта — только измеряя IAE на железе. Ключ DSO: знание добывается из эксперимента, а не из предположений.
+
+---
+
+## 9. Ключевые выводы
 
 1. **Variance — первичный критерий DSO:** NSGA-II находит регуляторы с высоким DetVar ценой небольшой потери IAE
 2. **NSGA-II beats PID на Non-Min Phase 70×** — IAE=0.41 vs 28.97 (pop=80, gens=30), 29 cycles, 40B RAM
@@ -407,7 +464,7 @@ Integrator+Delay          3.815    4.022   5.4%    18     16      6
     - На Underdamped контракт ≤80cyc/48B мешает достичь качества PID (0.32 vs 1.32)
     - SysTick в QEMU квантован — для абсолютных циклов нужен статический WCET или реальная плата
 
-## 8. Предложения по дальнейшему развитию
+## 10. Предложения по дальнейшему развитию
 
 ### ✅ Выполнено: NSGA-II multi-objective (Priority 3)
 Scalarization заменён на NSGA-II (non-dominated sorting, crowding distance, μ+λ, duplicate suppression). Результаты в разделе 5 — NSGA-II доминирует scalarized по IAE на всех 5 plants.
@@ -448,18 +505,18 @@ IAE совпадает с Python в пределах 0–5.4%. Результа�
 ### Priority 2: C code generation ✅ выполнено
 `racs_codegen/`: tree → C → clang → ld.lld → QEMU MPS2-AN386, статический WCET. Модель калибрована (раздел 7).
 
-### Priority 4: DSO streaming compiler
-**Что:** Многоскоростной dataflow: разные регуляторы на разных частотах (fast loop = inner current, slow loop = outer position), compile-time план.
-**Зачем:** Реальные встраиваемые системы — это не один регулятор, а pipeline 3–10 задач.
-**Где:** Новый модуль `dso_stream.py`.
+### Priority 4: DSO streaming compiler ✅ выполнено
+`racs_codegen/dso_stream.py` — multi-rate compile-time scheduler + codegen. Демо (раздел 7): IAE −30%, CPU −52%.
+
+### Priority 6: On-target Bayesian optimization ✅ выполнено
+`racs_codegen/bo.py` — GP-EI оптимизация на target. Бьёт random (+5–9%) и обходит NSGA-II на 2/3 plants (раздел 8).
 
 ### Priority 5: Hardware-in-the-loop ✅ выполнено
 `racs_codegen/hil.py`: plant + контроллер вместе на QEMU Cortex-M4. IAE валидирован (раздел 6).
 Следующее: реальная плата STM32F4-Discovery (не эмулятор).
 
-### Priority 6: On-target Bayesian optimisation
-**Что:** Вместо random + GP в Python — запускать скомпилированные регуляторы на цели (или QEMU), измерять реальный IAE + ресурсы, использовать Bayesian optimisation (Gaussian Process surrogate).
-**Зачем:** Model-free оптимизация, не требует симуляции plant в Python. Работает на неизвестной динамике.
+### Priority 6: On-target Bayesian optimisation ✅ выполнено
+См. раздел 8.
 
 ### Priority 7: Hypervolume / knee-point selection
 **Что:** Автоматический выбор "лучшего компромисса" с фронта (knee point = максимум distance to utopia line), метрика гиперобъёма для сравнения поколений.
