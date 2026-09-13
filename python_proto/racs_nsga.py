@@ -434,14 +434,14 @@ if __name__ == '__main__':
               NonMinPhase, IntegratingDelay]
 
     t0 = time.time()
-    all_rows = run_nsga_benchmark(plants, contract, pop_size=60, generations=20)
+    all_rows = run_nsga_benchmark(plants, contract, pop_size=80, generations=30)
     print(f"\n\nTotal elapsed: {time.time()-t0:.0f}s")
 
     plot_pareto3d(all_rows)
     plot_front2d(all_rows)
 
     # Save
-    with open('/tmp/racs_nsga_results.pkl', 'wb') as f:
+    with open('/home/lain/racs_nsga_results.pkl', 'wb') as f:
         pickle.dump(all_rows, f)
 
-    print("\nDone. Results saved to /tmp/racs_nsga_results.pkl")
+    print("\nDone. Results saved to /home/lain/racs_nsga_results.pkl")
