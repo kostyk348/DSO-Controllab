@@ -434,7 +434,7 @@ if __name__ == '__main__':
               NonMinPhase, IntegratingDelay]
 
     t0 = time.time()
-    all_rows = run_nsga_benchmark(plants, contract, pop_size=200, generations=60)
+    all_rows = run_nsga_benchmark(plants, contract, pop_size=80, generations=30)
     print(f"\n\nTotal elapsed: {time.time()-t0:.0f}s")
 
     plot_pareto3d(all_rows)
