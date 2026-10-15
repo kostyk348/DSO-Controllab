@@ -1,7 +1,7 @@
 # DSO-ControlLab
 
 [![CI](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml/badge.svg)](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
 [![C](https://img.shields.io/badge/C-11-blue.svg)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![Ada SPARK](https://img.shields.io/badge/Ada-SPARK-orange.svg)](https://www.adacore.com/about-spark)
@@ -24,15 +24,25 @@ It generates random second-order worlds, runs every controller on each world, me
 
 ## Quick Start
 
-```bash
-python3 -m dso_controllab --worlds 1000 --seed 7
-```
-
-For a fast smoke run:
+Команды проверены на чистом клоне (Python 3.14.7, numpy 2.5.4, 15.10.2026).
 
 ```bash
-python3 -m dso_controllab --worlds 50 --seed 1
+git clone https://github.com/kostyk348/DSO-Controllab.git
+cd DSO-Controllab
+pip install numpy                      # единственная внешняя зависимость Python-прототипа
+
+# smoke-прогон: 50 миров, ~20 с
+PYTHONPATH=src python3 -m dso_controllab --worlds 50 --seed 1
+
+# тесты
+python3 -m pytest tests/ -v            # 1 passed
+
+# полный прогон: 1000 миров, ~8 мин (измерено: 478 с)
+PYTHONPATH=src python3 -m dso_controllab --worlds 1000 --seed 7
 ```
+
+`PYTHONPATH=src` нужен потому, что пакет лежит в `src/` и в PyPI не публикуется; ту же
+smoke-команду гоняет CI шагом «CLI smoke run».
 
 ## Metrics
 

@@ -19,6 +19,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install numpy
+        run: pip install numpy pytest
       - name: Run tests
-        run: python3 -m pytest tests/
+        run: python3 -m pytest tests/ -v
+      - name: CLI smoke run (README quick start)
+        run: PYTHONPATH=src python3 -m dso_controllab --worlds 50 --seed 1
