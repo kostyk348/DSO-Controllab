@@ -6,6 +6,9 @@
 [![C](https://img.shields.io/badge/C-11-blue.svg)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![Ada SPARK](https://img.shields.io/badge/Ada-SPARK-orange.svg)](https://www.adacore.com/about-spark)
 [![GNATprove](https://img.shields.io/badge/GNATprove-verified-success.svg)](gp/controller.gpr)
+[![Release](https://img.shields.io/github/v/release/kostyk348/DSO-Controllab?sort=semver&color=blue)](https://github.com/kostyk348/DSO-Controllab/releases)
+[![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/DSO-Controllab/blob/main/LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/kostyk348/DSO-Controllab?branch=main)](https://github.com/kostyk348/DSO-Controllab/commits/main)
 
 DSO-ControlLab is a small, reproducible research bench for testing the core DSO idea in control systems:
 
@@ -32,12 +35,15 @@ cd DSO-Controllab
 pip install numpy                      # единственная внешняя зависимость Python-прототипа
 
 # smoke-прогон: 50 миров, ~20 с
+
 PYTHONPATH=src python3 -m dso_controllab --worlds 50 --seed 1
 
 # тесты
+
 python3 -m pytest tests/ -v            # 1 passed
 
 # полный прогон: 1000 миров, ~8 мин (измерено: 478 с)
+
 PYTHONPATH=src python3 -m dso_controllab --worlds 1000 --seed 7
 ```
 
@@ -193,6 +199,7 @@ as nonlinear damping — no explicit `Error` terminal needed.
 ./dso_gp --pop 100 --gen 50 --seed 7 --export-ada controller
 gnatprove -P controller.gpr --level=2
 # → Success: all checks proved (12 checks)
+
 ```
 
 The generated code includes:
