@@ -1,4 +1,10 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="DSO-Controllab banner" width="1000">
+
 # DSO-ControlLab
+
+### DSO-ControlLab is a small, reproducible research bench for testing the core DSO idea in control systems:
 
 [![CI](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml/badge.svg)](https://github.com/kostyk348/DSO-Controllab/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -7,10 +13,12 @@
 [![Ada SPARK](https://img.shields.io/badge/Ada-SPARK-orange.svg)](https://www.adacore.com/about-spark)
 [![GNATprove](https://img.shields.io/badge/GNATprove-verified-success.svg)](gp/controller.gpr)
 [![Release](https://img.shields.io/github/v/release/kostyk348/DSO-Controllab?sort=semver&color=blue)](https://github.com/kostyk348/DSO-Controllab/releases)
-[![License](https://img.shields.io/badge/license-Apache-2.0-green)](https://github.com/kostyk348/DSO-Controllab/blob/main/LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/kostyk348/DSO-Controllab?branch=main)](https://github.com/kostyk348/DSO-Controllab/commits/main)
 
-DSO-ControlLab is a small, reproducible research bench for testing the core DSO idea in control systems:
+</div>
+
+---
+
 
 > Move as many decisions as possible before runtime, then execute a verified deterministic plan.
 
