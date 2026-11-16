@@ -290,3 +290,15 @@ tests/
 - 6. Replace estimated resource costs with measured embedded targets.
 - **7. Auto-GNATprove pipeline** — verify every candidate, not just the best.
 - **8. ARM cross-compilation** — measure real WCET/jitter on ESP32/STM32.
+
+## Contributing
+
+- **[Good first issues](https://github.com/kostyk348/DSO-Controllab/labels/good%20first%20issue)** — scoped tasks with the acceptance
+  criteria written down, sized for one sitting.
+- **[Discussions](https://github.com/kostyk348/DSO-Controllab/discussions)** — questions, ideas and "how do I…"; issues are for bugs.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to build, test and submit a change.
+- **[SECURITY.md](SECURITY.md)** — private reporting for vulnerabilities (never a public issue).
+
+Pull requests are reviewed against one rule: the description must say **what problem** it solves and
+**how it was verified** — a CI link or a pasted command output.
+
