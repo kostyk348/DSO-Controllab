@@ -20,6 +20,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: pip install numpy pytest
+      - name: Контракты без зависимостей (голый stdlib)
+        run: python3 -m unittest discover -s tests -p "test_contracts.py" -v
+
       - name: Run tests
         run: python3 -m pytest tests/ -v
       - name: CLI smoke run (README quick start)

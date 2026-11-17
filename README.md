@@ -58,6 +58,22 @@ PYTHONPATH=src python3 -m dso_controllab --worlds 1000 --seed 7
 `PYTHONPATH=src` нужен потому, что пакет лежит в `src/` и в PyPI не публикуется; ту же
 smoke-команду гоняет CI шагом «CLI smoke run».
 
+## Tests
+
+```bash
+# контракты — только стандартная библиотека, без numpy и pytest
+python3 -m unittest discover -s tests -p "test_contracts.py" -v
+
+# смоук + полный набор (нужны numpy и pytest)
+python3 -m pytest tests/ -v
+```
+
+`tests/test_contracts.py` проверяет то, на чём держится вердикт «план прошёл»: значения по
+умолчанию у `ResourceContract` (WCET меньше периода цикла), неизменяемость датаклассов,
+`VerificationResult.compact()` — плоская строка для CSV, где `verification_passed` это 0/1,
+`violations` — строка через запятую, а метрики остаются числами. Эти тесты намеренно не
+тянут numpy: они должны проходить на любой машине, даже там, где зависимости не поставлены.
+
 ## Metrics
 
 - `iae`: integral absolute error, lower is better.
